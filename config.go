@@ -41,6 +41,7 @@ type config struct {
 	defaultMode   acp1.SessionModeID
 	maxTokens     int
 	maxSteps      int
+	compactRatio  float64 // compact at this share of the context window; 0 never
 	sessionDir    string
 	shell         string
 }
@@ -54,6 +55,7 @@ const envHelp = `Environment:
   DEEPSEEK_MAX_TOKENS      max output tokens per response; default 256000
   DEEPSEEK_ACP_MODE        initial mode: read-only, ask, accept-edits or full-access; default ask
   DEEPSEEK_ACP_MAX_STEPS   max model calls per prompt; default 200
+  DEEPSEEK_ACP_COMPACT_RATIO share of the context window at which the conversation is summarized; 0 turns it off; default 0.8
   DEEPSEEK_ACP_SESSIONS    session directory; default deepseek-acp/sessions in the user cache directory
   DEEPSEEK_ACP_SHELL       shell for the bash tool when run locally; default bash
 `
@@ -92,6 +94,12 @@ func loadConfig() (*config, error) {
 	}
 	if cfg.maxSteps, err = intEnv("DEEPSEEK_ACP_MAX_STEPS", 200); err != nil {
 		return nil, err
+	}
+	cfg.compactRatio = 0.8
+	if s := os.Getenv("DEEPSEEK_ACP_COMPACT_RATIO"); s != "" {
+		if cfg.compactRatio, err = strconv.ParseFloat(s, 64); err != nil || cfg.compactRatio < 0 || cfg.compactRatio >= 1 {
+			return nil, fmt.Errorf("DEEPSEEK_ACP_COMPACT_RATIO: want a number from 0 up to 1, got %q", s)
+		}
 	}
 	if cfg.sessionDir = os.Getenv("DEEPSEEK_ACP_SESSIONS"); cfg.sessionDir == "" {
 		cache, err := os.UserCacheDir()

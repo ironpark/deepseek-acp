@@ -71,7 +71,36 @@ func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessio
 	if err := a.replay(ctx, stream, sess); err != nil {
 		return nil, err
 	}
+	if err := a.sendContextUsage(ctx, stream, sess); err != nil {
+		return nil, err
+	}
 	return &acp1.LoadSessionResponse{Modes: sess.SessionModes(), ConfigOptions: sess.SessionConfigOptions()}, nil
+}
+
+// ResumeSession resumes the session through the manager and restores the
+// client's context usage display.
+func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSessionRequest) (*acp1.ResumeSessionResponse, error) {
+	resp, err := a.SessionManager.ResumeSession(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	if sess, err := a.Lookup(ctx, params.SessionID); err == nil {
+		if err := a.sendContextUsage(ctx, acp1.NewSessionStream(a.client, params.SessionID), sess); err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
+}
+
+// sendContextUsage tells the client how full the context window is, as of
+// the session's last model call.
+func (a *deepseekAgent) sendContextUsage(ctx context.Context, stream *acp1.SessionStream, sess *session) error {
+	used := sess.contextTokens()
+	if used == 0 {
+		return nil
+	}
+	model, _ := sess.settings()
+	return stream.SendUsage(ctx, uint64(used), uint64(lookupModel(model).contextWindow), nil)
 }
 
 func (a *deepseekAgent) replay(ctx context.Context, stream *acp1.SessionStream, sess *session) error {
@@ -88,6 +117,8 @@ func (a *deepseekAgent) replay(ctx context.Context, stream *acp1.SessionStream, 
 		for _, b := range m.Content {
 			var err error
 			switch {
+			case m.Role == "user" && b.Type == "text" && strings.HasPrefix(b.Text, summaryPrefix):
+				err = stream.SendThought(ctx, b.Text)
 			case m.Role == "user" && b.Type == "text" && !strings.HasPrefix(b.Text, runtimeContextPrefix):
 				err = stream.SendUserMessage(ctx, b.Text)
 			case m.Role == "assistant" && b.Type == "thinking" && b.Thinking != nil && *b.Thinking != "":
@@ -129,13 +160,28 @@ func (a *deepseekAgent) replayToolCall(ctx context.Context, stream *acp1.Session
 	return stream.CompleteToolCall(ctx, id)
 }
 
-// Prompt runs the turn through the embedded manager, whose CancelSession
-// cancels the turn's context, which also aborts the request to DeepSeek.
+// Prompt runs the turn under the embedded manager, whose CancelSession
+// cancels the turn's context, which also aborts the request to DeepSeek. The
+// response reports the session's token usage.
 func (a *deepseekAgent) Prompt(ctx context.Context, params *acp1.PromptRequest) (*acp1.PromptResponse, error) {
-	return a.RunTurn(ctx, params.SessionID, func(ctx context.Context, sess *session) (acp1.StopReason, error) {
-		defer a.save(ctx, params.SessionID, sess)
-		return a.runTurn(ctx, params.SessionID, sess, params.Prompt)
-	})
+	sess, err := a.Lookup(ctx, params.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	turn, done, err := a.BeginTurn(ctx, params.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	reason, err := a.runTurn(turn, params.SessionID, sess, params.Prompt)
+	a.save(turn, params.SessionID, sess)
+	if context.Cause(turn) == acp.ErrTurnCancelled {
+		reason, err = acp1.StopReasonCancelled, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &acp1.PromptResponse{StopReason: reason, Usage: sess.acpUsage()}, nil
 }
 
 // runTurn answers the prompt: it calls the model, runs the tools it asks for,
@@ -170,11 +216,20 @@ func (a *deepseekAgent) runTurn(ctx context.Context, sessionID acp1.SessionID, s
 	}
 
 	sess.setTitleFrom(acp1.JoinTexts(prompt))
+	if err := a.maybeCompact(ctx, stream, sess, req, info, false); err != nil {
+		if ctx.Err() != nil {
+			return acp1.StopReasonCancelled, nil
+		}
+		return "", err
+	}
 	sess.commit(userMessage(sess, prompt, info.images))
 
 	for range a.cfg.maxSteps {
 		req.Messages = sess.messages()
 		reply, err := a.llm.Stream(ctx, req, handler)
+		if reply != nil {
+			sess.recordUsage(reply.Usage)
+		}
 		if err != nil {
 			// Keep what the user already saw of an interrupted answer, but
 			// no tool calls, which would have no results.
@@ -231,6 +286,12 @@ func (a *deepseekAgent) runTurn(ctx context.Context, sessionID acp1.SessionID, s
 			return "", connErr
 		case reply.StopReason == "max_tokens":
 			return acp1.StopReasonMaxTokens, nil
+		}
+		if err := a.maybeCompact(ctx, stream, sess, req, info, true); err != nil {
+			if ctx.Err() != nil {
+				return acp1.StopReasonCancelled, nil
+			}
+			return "", err
 		}
 	}
 	return acp1.StopReasonMaxTurnRequests, nil

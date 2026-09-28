@@ -87,6 +87,97 @@ func (c *testClient) RequestPermission(_ context.Context, p *acp1.RequestPermiss
 	return acp1.PermissionSelected(p.Options[0].OptionID), nil
 }
 
+// startAgent connects a test client to an agent backed by fake, and opens a
+// session in dir.
+func startAgent(t *testing.T, dir string, fake *fakeDeepSeek) (*acp1.ClientSideConnection, *testClient, acp1.SessionStore[*session], *acp1.NewSessionResponse) {
+	t.Helper()
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	cfg := &config{
+		apiKey: "test-key", baseURL: server.URL + "/anthropic",
+		defaultModel: "deepseek-v4-flash", defaultEffort: "high", defaultMode: askMode,
+		maxTokens: 1000, maxSteps: 10, compactRatio: 0.8, shell: "bash",
+	}
+	store, err := acp1.NewFileStore[*session](filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	llm := &deepseek.Client{BaseURL: cfg.baseURL, APIKey: cfg.apiKey}
+	client := &testClient{}
+	_, conn := acp1.Pipe(t.Context(), newAgent(cfg, store, llm, logger), func(*acp1.ClientSideConnection) acp1.Client { return client })
+	if _, err := conn.Initialize(t.Context(), &acp1.InitializeRequest{ProtocolVersion: acp1.ProtocolVersion}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := conn.NewSession(t.Context(), &acp1.NewSessionRequest{Cwd: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn, client, store, resp
+}
+
+// textReply is a streamed answer of text alone.
+func textReply(text string, input, output int) string {
+	return sse(
+		fmt.Sprintf(`{"type":"message_start","message":{"usage":{"input_tokens":%d,"output_tokens":0}}}`, input),
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`, text),
+		`{"type":"content_block_stop","index":0}`,
+		fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":%d}}`, output),
+		`{"type":"message_stop"}`,
+	)
+}
+
+func TestCompaction(t *testing.T) {
+	dir := t.TempDir()
+	fake := &fakeDeepSeek{responses: []string{
+		textReply("SUMMARY OF EARLIER WORK", 900_000, 50),
+		textReply("done", 2_000, 10),
+	}}
+	conn, client, store, newResp := startAgent(t, dir, fake)
+
+	// A conversation that fills 90% of the context window.
+	sess, _, err := store.Get(t.Context(), newResp.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.history = []deepseek.Message{
+		{Role: "user", Content: []deepseek.Block{deepseek.TextBlock("earlier question")}},
+		{Role: "assistant", Content: []deepseek.Block{deepseek.TextBlock("earlier answer")}},
+	}
+	sess.contextUsed = 900_000
+	if err := store.Set(t.Context(), newResp.SessionID, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := conn.Prompt(t.Context(), &acp1.PromptRequest{SessionID: newResp.SessionID, Prompt: []acp1.ContentBlock{acp1.TextBlock("next question")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StopReason != acp1.StopReasonEndTurn || resp.Usage == nil || resp.Usage.TotalTokens != 902_060 {
+		t.Errorf("response = %+v, usage %+v", resp, resp.Usage)
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(fake.requests))
+	}
+	summarize := fake.requests[0].Messages
+	if len(summarize) != 3 || !strings.Contains(summarize[2].Content[0].Text, "about to be compacted") {
+		t.Errorf("summary request = %+v", summarize)
+	}
+	next := fake.requests[1].Messages
+	if len(next) != 1 || len(next[0].Content) != 2 ||
+		!strings.Contains(next[0].Content[0].Text, "SUMMARY OF EARLIER WORK") || next[0].Content[1].Text != "next question" {
+		t.Errorf("request after compaction = %+v", next)
+	}
+	if !strings.Contains(strings.Join(client.updates, ","), "tool_call") {
+		t.Errorf("compaction not shown: %v", client.updates)
+	}
+	sess, _, _ = store.Get(t.Context(), newResp.SessionID)
+	if got := sess.contextTokens(); got != 2_010 {
+		t.Errorf("context used after the turn = %d, want 2010", got)
+	}
+}
+
 func TestPromptRunsToolLoop(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeDeepSeek{responses: []string{
@@ -113,33 +204,8 @@ func TestPromptRunsToolLoop(t *testing.T) {
 			`{"type":"message_stop"}`,
 		),
 	}}
-	server := httptest.NewServer(fake)
-	defer server.Close()
-
-	cfg := &config{
-		apiKey: "test-key", baseURL: server.URL + "/anthropic",
-		defaultModel: "deepseek-v4-flash", defaultEffort: "high", defaultMode: askMode,
-		maxTokens: 1000, maxSteps: 10, shell: "bash",
-	}
-	store, err := acp1.NewFileStore[*session](filepath.Join(dir, "sessions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	client := &testClient{}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	llm := &deepseek.Client{BaseURL: cfg.baseURL, APIKey: cfg.apiKey}
-	_, conn := acp1.Pipe(ctx, newAgent(cfg, store, llm, logger), func(*acp1.ClientSideConnection) acp1.Client { return client })
-
-	if _, err := conn.Initialize(ctx, &acp1.InitializeRequest{ProtocolVersion: acp1.ProtocolVersion}); err != nil {
-		t.Fatal(err)
-	}
-	newResp, err := conn.NewSession(ctx, &acp1.NewSessionRequest{Cwd: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	conn, client, _, newResp := startAgent(t, dir, fake)
 	if len(newResp.ConfigOptions) != 2 || newResp.Modes == nil {
 		t.Fatalf("session/new: want modes and 2 config options, got %+v", newResp)
 	}
@@ -149,6 +215,9 @@ func TestPromptRunsToolLoop(t *testing.T) {
 	}
 	if resp.StopReason != acp1.StopReasonEndTurn {
 		t.Errorf("stop reason = %s, want end_turn", resp.StopReason)
+	}
+	if u := resp.Usage; u == nil || u.InputTokens != 250 || u.OutputTokens != 25 || u.TotalTokens != 275 {
+		t.Errorf("usage = %+v, want 250 in, 25 out", u)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "hello.txt"))

@@ -42,6 +42,19 @@ type session struct {
 	// todos is the plan the model keeps with todo_write.
 	todos []acp1.PlanEntry
 	title string
+
+	// usage sums the tokens of every model call in the session, and
+	// contextUsed is how much of the context window the last call filled.
+	usage       tokenUsage
+	contextUsed int
+}
+
+// tokenUsage counts tokens across a session's model calls.
+type tokenUsage struct {
+	Input      uint64 `json:"input"` // not counting cache reads and writes
+	Output     uint64 `json:"output"`
+	CacheRead  uint64 `json:"cacheRead,omitzero"`
+	CacheWrite uint64 `json:"cacheWrite,omitzero"`
 }
 
 func newSession(cwd string, cfg *config) *session {
@@ -75,6 +88,55 @@ func (s *session) commit(messages ...deepseek.Message) {
 }
 
 // settings returns the model and reasoning effort for the next request.
+// recordUsage adds a model call's tokens to the session's totals.
+func (s *session) recordUsage(u deepseek.Usage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage.Input += uint64(u.InputTokens)
+	s.usage.Output += uint64(u.OutputTokens)
+	s.usage.CacheRead += uint64(u.CacheReadInputTokens)
+	s.usage.CacheWrite += uint64(u.CacheCreationInputTokens)
+	if used := u.ContextTokens(); used > 0 {
+		s.contextUsed = used
+	}
+}
+
+// contextTokens is how much of the context window the conversation fills,
+// as of the last model call.
+func (s *session) contextTokens() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contextUsed
+}
+
+// acpUsage reports the session's token totals for a prompt response.
+// Input counts cache reads and writes too, as they are input tokens.
+func (s *session) acpUsage() *acp1.Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.usage
+	input := u.Input + u.CacheRead + u.CacheWrite
+	usage := &acp1.Usage{InputTokens: input, OutputTokens: u.Output, TotalTokens: input + u.Output}
+	if u.CacheRead > 0 {
+		usage.CachedReadTokens = new(u.CacheRead)
+	}
+	if u.CacheWrite > 0 {
+		usage.CachedWriteTokens = new(u.CacheWrite)
+	}
+	return usage
+}
+
+// replaceHistory replaces the conversation with a compacted one, whose first
+// message states the current mode, and records its estimated size.
+func (s *session) replaceHistory(history []deepseek.Message, contextUsed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history = history
+	s.toldMode = s.mode
+	s.contextUsed = contextUsed
+	s.updated = time.Now()
+}
+
 func (s *session) settings() (model, effort string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -309,6 +371,8 @@ type savedSession struct {
 	Todos   []acp1.PlanEntry   `json:"todos,omitzero"`
 	Title   string             `json:"title,omitzero"`
 	Updated time.Time          `json:"updated,omitzero"`
+	Usage   tokenUsage         `json:"usage,omitzero"`
+	Context int                `json:"contextUsed,omitzero"`
 }
 
 // MarshalJSON saves the session for the store; a turn may be changing it.
@@ -319,6 +383,7 @@ func (s *session) MarshalJSON() ([]byte, error) {
 	saved := savedSession{
 		Cwd: s.cwd, Mode: s.mode, Model: s.model, Effort: s.effort, History: slices.Clone(s.history),
 		Allowed: slices.Sorted(maps.Keys(s.allowed)), Todos: s.todos, Title: s.title, Updated: s.updated,
+		Usage: s.usage, Context: s.contextUsed,
 	}
 	s.mu.Unlock()
 	return json.Marshal(saved)
@@ -332,6 +397,7 @@ func (s *session) UnmarshalJSON(data []byte) error {
 	}
 	s.cwd, s.mode, s.model, s.effort = saved.Cwd, saved.Mode, saved.Model, saved.Effort
 	s.history, s.todos, s.title, s.updated = saved.History, saved.Todos, saved.Title, saved.Updated
+	s.usage, s.contextUsed = saved.Usage, saved.Context
 	for _, tool := range saved.Allowed {
 		if s.allowed == nil {
 			s.allowed = map[string]bool{}

@@ -1,5 +1,7 @@
 # deepseek-acp
 
+English | [한국어](README.ko.md)
+
 A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, built on
 [ironpark/acp-go](https://github.com/ironpark/acp-go) and modeled on
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness).
@@ -13,6 +15,9 @@ A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentcli
 - Modes: `read-only`, `ask` (default), `accept-edits`, `full-access`. Config options: model and reasoning effort.
 - Sessions are saved to disk and support `session/list`, `load`, `resume`, `close`, `delete`.
 - `AGENTS.md` (or `CLAUDE.md`) in the working directory is added to the system prompt.
+- Reports context window usage (`usage_update`, also restored on `session/load` and `resume`) and the session's token
+  totals in each prompt response. When the conversation reaches 80% of the context window (keeping 64K tokens free), it
+  is summarized and replaced by the summary, as the harness's compaction does.
 
 ## Build
 
@@ -22,12 +27,42 @@ go build -o bin/deepseek-acp .
 
 ## Zed
 
+With a built binary:
+
 ```json
 {
   "agent_servers": {
     "DeepSeek": {
       "command": "/path/to/bin/deepseek-acp",
       "args": [],
+      "env": { "DEEPSEEK_API_KEY": "sk-..." }
+    }
+  }
+}
+```
+
+Or with `go run` from a checkout, which builds the current source on each start (the first start is slower while it compiles; `go` must be on Zed's `PATH`):
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek": {
+      "command": "go",
+      "args": ["-C", "/path/to/deepseek-acp", "run", "."],
+      "env": { "DEEPSEEK_API_KEY": "sk-..." }
+    }
+  }
+}
+```
+
+Or from the module path, without a checkout:
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek": {
+      "command": "go",
+      "args": ["run", "github.com/ironpark/deepseek-acp@latest"],
       "env": { "DEEPSEEK_API_KEY": "sk-..." }
     }
   }
@@ -46,6 +81,7 @@ go build -o bin/deepseek-acp .
 | `DEEPSEEK_MAX_TOKENS` | `256000` |
 | `DEEPSEEK_ACP_MODE` | `ask` |
 | `DEEPSEEK_ACP_MAX_STEPS` | `200` model calls per prompt |
+| `DEEPSEEK_ACP_COMPACT_RATIO` | `0.8` share of the context window that triggers compaction; `0` turns it off |
 | `DEEPSEEK_ACP_SESSIONS` | `<user cache dir>/deepseek-acp/sessions` |
 | `DEEPSEEK_ACP_SHELL` | `bash` |
 
