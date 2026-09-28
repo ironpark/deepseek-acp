@@ -206,8 +206,8 @@ func TestPromptRunsToolLoop(t *testing.T) {
 	}}
 	ctx := t.Context()
 	conn, client, _, newResp := startAgent(t, dir, fake)
-	if len(newResp.ConfigOptions) != 2 || newResp.Modes == nil {
-		t.Fatalf("session/new: want modes and 2 config options, got %+v", newResp)
+	if len(newResp.ConfigOptions) != 3 || newResp.Modes == nil {
+		t.Fatalf("session/new: want modes and 3 config options, got %+v", newResp)
 	}
 	resp, err := conn.Prompt(ctx, &acp1.PromptRequest{SessionID: newResp.SessionID, Prompt: []acp1.ContentBlock{acp1.TextBlock("write hello.txt")}})
 	if err != nil {

@@ -11,7 +11,8 @@
 - 도구는 harness의 핵심 도구 세트를 따릅니다: `read`, `write`, `edit`, `glob`, `grep`, `bash`, `todo_write`(ACP plan으로 표시).
 - 파일 읽기·쓰기와 명령 실행은 클라이언트가 지원하면 클라이언트(`fs/*`, `terminal/*`)를 거치고, 지원하지 않으면 로컬에서 실행합니다.
   클라이언트를 거치면 에디터에서 diff, 저장하지 않은 버퍼, 실시간 터미널을 볼 수 있습니다.
-- 모드: `read-only`, `ask`(기본), `accept-edits`, `full-access`. 설정 옵션: 모델, reasoning effort.
+- 권한 모드: `read-only`, `ask`(기본), `accept-edits`, `full-access`. 모델·reasoning effort와 같은 설정 옵션으로 선택할 수 있으며,
+  ACP 세션 모드로도 함께 제공됩니다.
 - 세션은 디스크에 저장되며 `session/list`, `load`, `resume`, `close`, `delete`를 지원합니다.
 - 작업 디렉터리의 `AGENTS.md`(없으면 `CLAUDE.md`)를 시스템 프롬프트에 추가합니다.
 - 컨텍스트 창 사용량을 `usage_update`로 알리고(`session/load`, `resume` 때도 복원), 프롬프트 응답마다 세션 누적 토큰 사용량을 담습니다.

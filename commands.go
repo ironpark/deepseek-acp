@@ -141,6 +141,9 @@ func (a *deepseekAgent) permissionCommand(ctx context.Context, c *commandCall) (
 	if err := c.stream.SendModeUpdate(ctx, mode); err != nil {
 		return "", err
 	}
+	if err := c.stream.SendConfigUpdate(ctx, c.sess.SessionConfigOptions()); err != nil {
+		return "", err
+	}
 	return c.reply(ctx, fmt.Sprintf("Permission mode: %s.", mode))
 }
 

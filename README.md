@@ -12,7 +12,8 @@ A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentcli
 - Tools, after the harness's core set: `read`, `write`, `edit`, `glob`, `grep`, `bash`, `todo_write` (shown as the ACP plan).
 - File reads/writes and commands go through the client (`fs/*`, `terminal/*`) when it supports them — so the editor
   shows diffs, unsaved buffers and live terminals — and run locally otherwise.
-- Modes: `read-only`, `ask` (default), `accept-edits`, `full-access`. Config options: model and reasoning effort.
+- Permission modes: `read-only`, `ask` (default), `accept-edits`, `full-access`. They can be picked like the model and
+  reasoning effort, which are config options too; the mode is offered both as a config option and as an ACP session mode.
 - Sessions are saved to disk and support `session/list`, `load`, `resume`, `close`, `delete`.
 - `AGENTS.md` (or `CLAUDE.md`) in the working directory is added to the system prompt.
 - Reports context window usage (`usage_update`, also restored on `session/load` and `resume`) and the session's token

@@ -317,9 +317,11 @@ func (s *session) SessionModes() *acp1.SessionModeState {
 	return &acp1.SessionModeState{CurrentModeID: s.currentMode(), AvailableModes: modes}
 }
 
-// Config options: the model and the reasoning effort, like the harness's
-// ACP server.
+// Config options: the permission mode, which is also a session mode for
+// clients without config options, and the model and reasoning effort, like
+// the harness's ACP server.
 const (
+	modeOption   acp1.SessionConfigID = "mode"
 	modelOption  acp1.SessionConfigID = "model"
 	effortOption acp1.SessionConfigID = "reasoning_effort"
 )
@@ -346,9 +348,18 @@ func (s *session) SessionConfigOptions() []acp1.SessionConfigOption {
 	if !slices.ContainsFunc(offeredModels, func(m modelInfo) bool { return m.id == model }) {
 		models = append(models, acp1.SessionConfigSelectOption{Value: acp1.SessionConfigValueID(model), Name: model})
 	}
+	var modeValues []acp1.SessionConfigSelectOption
+	for _, m := range modes {
+		modeValues = append(modeValues, acp1.SessionConfigSelectOption{Value: acp1.SessionConfigValueID(m.ID), Name: m.Name, Description: m.Description})
+	}
+	modeChoices, _ := acp1.NewSessionConfigSelectOptions(modeValues)
 	modelChoices, _ := acp1.NewSessionConfigSelectOptions(models)
 	effortChoices, _ := acp1.NewSessionConfigSelectOptions(efforts)
 	return []acp1.SessionConfigOption{
+		acp1.NewSessionConfigOption(acp1.SessionConfigOptionSelect{
+			ID: modeOption, Name: "Permission Mode", CurrentValue: acp1.SessionConfigValueID(s.currentMode()),
+			Options: modeChoices, Category: new(acp1.SessionConfigOptionCategoryMode),
+		}),
 		acp1.NewSessionConfigOption(acp1.SessionConfigOptionSelect{
 			ID: modelOption, Name: "Model", CurrentValue: acp1.SessionConfigValueID(model),
 			Options: modelChoices, Category: new(acp1.SessionConfigOptionCategoryModel),
@@ -370,6 +381,10 @@ func (a *deepseekAgent) SetSessionMode(ctx context.Context, params *acp1.SetSess
 	}
 	sess.setMode(params.ModeID)
 	a.save(ctx, params.SessionID, sess)
+	// Keep the permission mode config option in step.
+	if err := acp1.NewSessionStream(a.client, params.SessionID).SendConfigUpdate(ctx, sess.SessionConfigOptions()); err != nil {
+		return nil, err
+	}
 	return &acp1.SetSessionModeResponse{}, nil
 }
 
@@ -384,6 +399,16 @@ func (a *deepseekAgent) SetSessionConfigOption(ctx context.Context, params *acp1
 	}
 	value := string(req.Value)
 	switch req.ConfigID {
+	case modeOption:
+		mode := acp1.SessionModeID(value)
+		if !validMode(mode) {
+			return nil, acp.InvalidParams(fmt.Sprintf("unknown mode %q", value))
+		}
+		sess.setMode(mode)
+		// Keep the session mode in step, for clients that show modes.
+		if err := acp1.NewSessionStream(a.client, req.SessionID).SendModeUpdate(ctx, mode); err != nil {
+			return nil, err
+		}
 	case modelOption:
 		if value == "" {
 			return nil, acp.InvalidParams("empty model")

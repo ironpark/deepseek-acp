@@ -175,3 +175,34 @@ func TestGoalPolicy(t *testing.T) {
 		t.Errorf("round cap: goal = %+v", sess.goal)
 	}
 }
+
+func TestPermissionModeConfigOption(t *testing.T) {
+	conn, client, store, s := startAgent(t, t.TempDir(), &fakeDeepSeek{})
+	if id := s.ConfigOptions[0].Variant().(acp1.SessionConfigOptionSelect).ID; id != modeOption {
+		t.Errorf("first config option = %s, want %s", id, modeOption)
+	}
+
+	resp, err := conn.SetSessionConfigOption(t.Context(), new(acp1.NewSetSessionConfigOptionRequest(
+		acp1.SetSessionConfigOptionRequestUntagged{SessionID: s.SessionID, ConfigID: modeOption, Value: "full-access"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.ConfigOptions[0].Variant().(acp1.SessionConfigOptionSelect).CurrentValue; got != "full-access" {
+		t.Errorf("config option value = %s", got)
+	}
+	sess, _, _ := store.Get(t.Context(), s.SessionID)
+	if sess.currentMode() != fullAccessMode || !client.seen("current_mode_update") {
+		t.Errorf("mode = %s; mode update sent: %v", sess.currentMode(), client.seen("current_mode_update"))
+	}
+
+	if _, err := conn.SetSessionMode(t.Context(), &acp1.SetSessionModeRequest{SessionID: s.SessionID, ModeID: readOnlyMode}); err != nil {
+		t.Fatal(err)
+	}
+	if !client.seen("config_option_update") {
+		t.Error("session/set_mode sent no config option update")
+	}
+	if _, err := conn.SetSessionConfigOption(t.Context(), new(acp1.NewSetSessionConfigOptionRequest(
+		acp1.SetSessionConfigOptionRequestUntagged{SessionID: s.SessionID, ConfigID: modeOption, Value: "yolo"}))); err == nil {
+		t.Error("accepted an unknown mode")
+	}
+}
