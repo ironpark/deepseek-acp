@@ -37,36 +37,44 @@ func (a *deepseekAgent) compactThreshold(info modelInfo) int {
 	return max(min(int(a.cfg.compactRatio*float64(info.contextWindow)), info.contextWindow-compactHeadroom), 1)
 }
 
-// maybeCompact summarizes the conversation when it fills the context window
-// past the threshold, and replaces the history with the summary. It must be
-// called between exchanges, when every tool call has its result. midTurn says
-// the model is in the middle of a task it should go on with.
-//
-// The summary request is the turn's request with one more instruction, so it
-// shares the prompt prefix and hits DeepSeek's cache. A failed compaction is
-// shown and logged but does not end the turn; only a cancelled turn does.
+// maybeCompact compacts the conversation when it fills the context window
+// past the threshold.
 func (a *deepseekAgent) maybeCompact(ctx context.Context, stream *acp1.SessionStream, sess *session, req deepseek.Request, info modelInfo, midTurn bool) error {
 	threshold := a.compactThreshold(info)
 	if threshold == 0 || sess.contextTokens() < threshold {
 		return nil
 	}
+	_, err := a.compact(ctx, stream, sess, req, info, midTurn)
+	return err
+}
+
+// compact summarizes the conversation and replaces the history with the
+// summary, and reports whether it did. It must be called between exchanges,
+// when every tool call has its result. midTurn says the model is in the
+// middle of a task it should go on with.
+//
+// The summary request is the turn's request with one more instruction, so it
+// shares the prompt prefix and hits DeepSeek's cache. A failed compaction is
+// shown and logged but returns no error; only a cancelled turn or a broken
+// connection does.
+func (a *deepseekAgent) compact(ctx context.Context, stream *acp1.SessionStream, sess *session, req deepseek.Request, info modelInfo, midTurn bool) (bool, error) {
 	id := acp1.GenerateToolCallID()
 	if err := stream.StartToolCall(ctx, id, "Compacting conversation", acp1.ToolKindThink); err != nil {
-		return err
+		return false, err
 	}
 	summary, err := a.summarize(ctx, sess, req)
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 	if err != nil {
 		a.logger.Warn("compaction failed", "session", stream.SessionID(), "error", err)
-		return stream.FailToolCall(ctx, id, acp1.WithToolContent(acp1.ToolText("Compaction failed: "+err.Error())))
+		return false, stream.FailToolCall(ctx, id, acp1.WithToolContent(acp1.ToolText("Compaction failed: "+err.Error())))
 	}
 
 	var note strings.Builder
 	fmt.Fprintf(&note, "%s\nThis session continues from an earlier conversation that ran out of context. Summary of it:\n\n%s\n", summaryPrefix, summary)
 	sess.mu.Lock()
-	todos, mode := sess.todos, sess.mode
+	todos := sess.todos
 	sess.mu.Unlock()
 	if len(todos) > 0 {
 		note.WriteString("\nThe plan, as kept with todo_write:\n")
@@ -74,7 +82,7 @@ func (a *deepseekAgent) maybeCompact(ctx context.Context, stream *acp1.SessionSt
 			fmt.Fprintf(&note, "- [%s] %s\n", t.Status, t.Content)
 		}
 	}
-	fmt.Fprintf(&note, "\nPermission mode: %s\n</conversation-summary>", modeContext[mode])
+	fmt.Fprintf(&note, "\n%s\n</conversation-summary>", sess.runtimeContext())
 	if midTurn {
 		note.WriteString("\nContinue the current task from where you left off.")
 	}
@@ -83,9 +91,9 @@ func (a *deepseekAgent) maybeCompact(ctx context.Context, stream *acp1.SessionSt
 	estimate := len(note.String()) / 3
 	sess.replaceHistory([]deepseek.Message{{Role: "user", Content: []deepseek.Block{deepseek.TextBlock(note.String())}}}, estimate)
 	if err := stream.SendUsage(ctx, uint64(estimate), uint64(info.contextWindow), nil); err != nil {
-		return err
+		return false, err
 	}
-	return stream.CompleteToolCall(ctx, id, acp1.WithToolContent(acp1.ToolText(summary)))
+	return true, stream.CompleteToolCall(ctx, id, acp1.WithToolContent(acp1.ToolText(summary)))
 }
 
 // summarize asks the model for a summary of the conversation.

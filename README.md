@@ -19,6 +19,20 @@ A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentcli
   totals in each prompt response. When the conversation reaches 80% of the context window (keeping 64K tokens free), it
   is summarized and replaced by the summary, as the harness's compaction does.
 
+## Commands
+
+Slash commands from the harness's human commands. They run without going to the model, and their result is shown
+without entering the conversation; `/plan` and `/goal` can go on to start a model turn.
+
+| Command | What it does |
+| --- | --- |
+| `/compact` | Summarizes the conversation now and replaces it with the summary. |
+| `/permission [mode]` | Shows or switches the mode: `read-only`, `ask`, `accept-edits`, `full-access` (the harness preset names `workspace-write` and `danger-full-access` work too). |
+| `/plan [off\|message]` | Turns plan mode on, optionally with a first request, or off. In plan mode the model explores and presents a plan with `exit_plan_mode` for approval; file writes and edits are refused until it is approved. |
+| `/goal [<objective>\|clear\|edit <objective>\|pause\|resume]` | Sets, shows or changes a long-running goal. The agent keeps working on an active goal in automatic rounds (up to 256) until the model marks it complete or blocked with `update_goal`. The model can also create one with `create_goal`. |
+
+The harness's `/feedback` (sends feedback to its telemetry backend) and `/export` (a Web download) are not included.
+
 ## Build
 
 ```sh

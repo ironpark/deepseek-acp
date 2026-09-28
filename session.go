@@ -33,10 +33,21 @@ type session struct {
 	history []deepseek.Message // the conversation, without the system prompt
 	updated time.Time
 
-	// toldMode is the mode the model was last told about, so a runtime
-	// context note is added only when it changes. The system prompt stays
+	// planMode is on while the model plans before acting (/plan).
+	planMode bool
+	// goal is the session's long-running objective (/goal), if any.
+	goal *goal
+	// goalArmed allows automatic goal rounds; like the harness, it is not
+	// saved, so a restored goal waits for /goal resume.
+	goalArmed bool
+	// goalRound is set while the model works on an automatic goal round
+	// rather than a direct request from the user.
+	goalRound bool
+
+	// toldContext is the runtime context the model was last told about, so
+	// a note is added only when it changes. The system prompt stays
 	// byte-stable, which keeps DeepSeek's prefix cache warm.
-	toldMode acp1.SessionModeID
+	toldContext string
 	// allowed holds the tools the user chose to always allow.
 	allowed map[string]bool
 	// todos is the plan the model keeps with todo_write.
@@ -132,7 +143,7 @@ func (s *session) replaceHistory(history []deepseek.Message, contextUsed int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.history = history
-	s.toldMode = s.mode
+	s.toldContext = s.runtimeContextLocked()
 	s.contextUsed = contextUsed
 	s.updated = time.Now()
 }
@@ -155,16 +166,48 @@ func (s *session) setMode(mode acp1.SessionModeID) {
 	s.mode = mode
 }
 
-// modeChange returns the mode if the model has not been told about it yet,
-// and marks it told.
-func (s *session) modeChange() (acp1.SessionModeID, bool) {
+// runtimeContextLocked describes the permission and plan modes for the
+// model. The caller holds s.mu.
+func (s *session) runtimeContextLocked() string {
+	text := "Permission mode: " + modeContext[s.mode]
+	if s.planMode {
+		text += "\n\n" + planModeContext
+	} else {
+		text += "\nPlan mode: off."
+	}
+	return text
+}
+
+// runtimeContext is runtimeContextLocked for callers without the lock.
+func (s *session) runtimeContext() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.toldMode == s.mode {
+	return s.runtimeContextLocked()
+}
+
+// contextChange returns the runtime context if the model has not been told
+// about it yet, and marks it told.
+func (s *session) contextChange() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text := s.runtimeContextLocked()
+	if text == s.toldContext {
 		return "", false
 	}
-	s.toldMode = s.mode
-	return s.mode, true
+	s.toldContext = text
+	return text, true
+}
+
+func (s *session) inPlanMode() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.planMode
+}
+
+func (s *session) setPlanMode(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planMode = on
 }
 
 func (s *session) isAllowed(tool string) bool {
@@ -373,6 +416,8 @@ type savedSession struct {
 	Updated time.Time          `json:"updated,omitzero"`
 	Usage   tokenUsage         `json:"usage,omitzero"`
 	Context int                `json:"contextUsed,omitzero"`
+	Plan    bool               `json:"planMode,omitzero"`
+	Goal    *goal              `json:"goal,omitzero"`
 }
 
 // MarshalJSON saves the session for the store; a turn may be changing it.
@@ -383,7 +428,7 @@ func (s *session) MarshalJSON() ([]byte, error) {
 	saved := savedSession{
 		Cwd: s.cwd, Mode: s.mode, Model: s.model, Effort: s.effort, History: slices.Clone(s.history),
 		Allowed: slices.Sorted(maps.Keys(s.allowed)), Todos: s.todos, Title: s.title, Updated: s.updated,
-		Usage: s.usage, Context: s.contextUsed,
+		Usage: s.usage, Context: s.contextUsed, Plan: s.planMode, Goal: s.goal.clone(),
 	}
 	s.mu.Unlock()
 	return json.Marshal(saved)
@@ -398,6 +443,7 @@ func (s *session) UnmarshalJSON(data []byte) error {
 	s.cwd, s.mode, s.model, s.effort = saved.Cwd, saved.Mode, saved.Model, saved.Effort
 	s.history, s.todos, s.title, s.updated = saved.History, saved.Todos, saved.Title, saved.Updated
 	s.usage, s.contextUsed = saved.Usage, saved.Context
+	s.planMode, s.goal = saved.Plan, saved.Goal
 	for _, tool := range saved.Allowed {
 		if s.allowed == nil {
 			s.allowed = map[string]bool{}

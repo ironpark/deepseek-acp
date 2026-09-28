@@ -98,7 +98,12 @@ var (
 	}
 )
 
-var tools = []deepseek.Tool{readTool, writeTool, editTool, globTool, grepTool, bashTool, todoWriteTool}
+// tools is the catalog offered to the model. It never changes with the
+// session's modes, so the request prefix stays cacheable.
+var tools = []deepseek.Tool{
+	readTool, writeTool, editTool, globTool, grepTool, bashTool, todoWriteTool,
+	exitPlanModeTool, createGoalTool, getGoalTool, updateGoalTool,
+}
 
 // action is a tool call ready to show the client and run.
 type action struct {
@@ -321,8 +326,85 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 				return "Plan updated.", nil, nil
 			},
 		}, nil
+
+	case exitPlanModeTool.Name:
+		args, err := decodeArgs[struct {
+			Plan string `json:"plan"`
+		}](call)
+		if err != nil {
+			return nil, err
+		}
+		return &action{
+			title: "Plan: " + planTitle(args.Plan),
+			kind:  acp1.ToolKindSwitchMode,
+			run: func(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
+				return a.exitPlanMode(ctx, stream, sess, id, args.Plan)
+			},
+		}, nil
+
+	case createGoalTool.Name:
+		args, err := decodeArgs[struct {
+			Objective     string  `json:"objective"`
+			MaxGoalRounds float64 `json:"max_goal_rounds"`
+		}](call)
+		if err != nil {
+			return nil, err
+		}
+		return &action{
+			title: "Create goal: " + oneLine(args.Objective),
+			kind:  acp1.ToolKindThink,
+			run: func(context.Context, *acp1.SessionStream, acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
+				result, err := sess.createGoal(args.Objective, int(args.MaxGoalRounds))
+				return result, []acp1.ToolCallContent{acp1.ToolText(result)}, err
+			},
+		}, nil
+
+	case getGoalTool.Name:
+		return &action{
+			title: "Read goal",
+			kind:  acp1.ToolKindThink,
+			run: func(context.Context, *acp1.SessionStream, acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
+				g := sess.currentGoal()
+				if g == nil {
+					return "There is no goal.", nil, nil
+				}
+				return g.describe(), nil, nil
+			},
+		}, nil
+
+	case updateGoalTool.Name:
+		args, err := decodeArgs[struct {
+			Action        string  `json:"action"`
+			Objective     string  `json:"objective"`
+			MaxGoalRounds float64 `json:"max_goal_rounds"`
+			BlockedReason string  `json:"blocked_reason"`
+		}](call)
+		if err != nil {
+			return nil, err
+		}
+		return &action{
+			title: "Update goal: " + args.Action,
+			kind:  acp1.ToolKindThink,
+			run: func(context.Context, *acp1.SessionStream, acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
+				g, err := sess.updateGoal(args.Action, args.Objective, int(args.MaxGoalRounds), args.BlockedReason)
+				if err != nil {
+					return "", nil, err
+				}
+				return "Goal updated.\n" + g.describe(), []acp1.ToolCallContent{acp1.ToolText(g.describe())}, nil
+			},
+		}, nil
 	}
 	return nil, fmt.Errorf("unknown tool %q", call.Name)
+}
+
+// planTitle is the plan's # heading, or a generic title.
+func planTitle(plan string) string {
+	for line := range strings.Lines(plan) {
+		if title, ok := strings.CutPrefix(strings.TrimSpace(line), "# "); ok {
+			return title
+		}
+	}
+	return "review"
 }
 
 func decodeArgs[T any](call deepseek.Block) (T, error) {
@@ -638,6 +720,9 @@ func commandResult(output string, truncated bool, code *int, signal string, time
 // permit decides whether a tool call may change files (edit) or run a
 // command, by the session's mode, asking the user when the mode says to.
 func (a *deepseekAgent) permit(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, tool string, edit bool, content ...acp1.ToolCallContent) error {
+	if edit && sess.inPlanMode() {
+		return errors.New("refused: plan mode is on; present the plan with exit_plan_mode instead of changing files")
+	}
 	switch mode := sess.currentMode(); {
 	case mode == fullAccessMode:
 		return nil

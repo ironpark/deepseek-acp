@@ -17,6 +17,20 @@
 - 컨텍스트 창 사용량을 `usage_update`로 알리고(`session/load`, `resume` 때도 복원), 프롬프트 응답마다 세션 누적 토큰 사용량을 담습니다.
   대화가 컨텍스트 창의 80%에 이르면(64K 토큰은 비워 둠) harness의 compaction처럼 대화를 요약해 요약본으로 바꿉니다.
 
+## 명령어
+
+harness의 명령어(human commands)를 옮긴 슬래시 명령어입니다. 모델에 보내지 않고 실행되며, 결과는 화면에만 표시되고 대화 기록에는
+남지 않습니다. `/plan`과 `/goal`은 이어서 모델 턴을 시작할 수 있습니다.
+
+| 명령어 | 동작 |
+| --- | --- |
+| `/compact` | 지금 대화를 요약해 요약본으로 바꿉니다. |
+| `/permission [mode]` | 모드를 보여 주거나 바꿉니다: `read-only`, `ask`, `accept-edits`, `full-access`. harness 프리셋 이름 `workspace-write`, `danger-full-access`도 받습니다. |
+| `/plan [off\|message]` | plan 모드를 켜거나(첫 요청을 함께 줄 수 있음) 끕니다. plan 모드에서 모델은 코드를 살펴본 뒤 `exit_plan_mode`로 계획을 제출해 승인을 받고, 승인 전에는 파일 쓰기·수정이 거부됩니다. |
+| `/goal [<objective>\|clear\|edit <objective>\|pause\|resume]` | 장기 목표를 설정·확인·변경합니다. 목표가 활성 상태면 모델이 `update_goal`로 완료나 막힘을 표시할 때까지 자동 라운드(최대 256회)로 계속 작업합니다. 모델이 `create_goal`로 직접 목표를 만들 수도 있습니다. |
+
+harness의 `/feedback`(harness 텔레메트리 백엔드로 피드백 전송)과 `/export`(웹 다운로드)는 옮기지 않았습니다.
+
 ## 빌드
 
 ```sh

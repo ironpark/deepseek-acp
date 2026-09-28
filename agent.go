@@ -57,6 +57,16 @@ func (a *deepseekAgent) Initialize(_ context.Context, params *acp1.InitializeReq
 	}, nil
 }
 
+// NewSession creates the session through the manager, then advertises its
+// slash commands.
+func (a *deepseekAgent) NewSession(ctx context.Context, params *acp1.NewSessionRequest) (*acp1.NewSessionResponse, error) {
+	resp, err := a.SessionManager.NewSession(ctx, params)
+	if err == nil {
+		a.advertiseCommands(resp.SessionID)
+	}
+	return resp, err
+}
+
 // LoadSession replays the conversation to the client: the user's messages,
 // the model's thinking and answers, and its tool calls.
 func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessionRequest) (*acp1.LoadSessionResponse, error) {
@@ -74,11 +84,14 @@ func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessio
 	if err := a.sendContextUsage(ctx, stream, sess); err != nil {
 		return nil, err
 	}
+	if err := stream.SendCommands(ctx, availableCommands()); err != nil {
+		return nil, err
+	}
 	return &acp1.LoadSessionResponse{Modes: sess.SessionModes(), ConfigOptions: sess.SessionConfigOptions()}, nil
 }
 
-// ResumeSession resumes the session through the manager and restores the
-// client's context usage display.
+// ResumeSession resumes the session through the manager, restores the
+// client's context usage display, and advertises the slash commands.
 func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSessionRequest) (*acp1.ResumeSessionResponse, error) {
 	resp, err := a.SessionManager.ResumeSession(ctx, params)
 	if err != nil {
@@ -89,6 +102,7 @@ func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSe
 			return nil, err
 		}
 	}
+	a.advertiseCommands(params.SessionID)
 	return resp, nil
 }
 
@@ -117,7 +131,7 @@ func (a *deepseekAgent) replay(ctx context.Context, stream *acp1.SessionStream, 
 		for _, b := range m.Content {
 			var err error
 			switch {
-			case m.Role == "user" && b.Type == "text" && strings.HasPrefix(b.Text, summaryPrefix):
+			case m.Role == "user" && b.Type == "text" && (strings.HasPrefix(b.Text, summaryPrefix) || strings.HasPrefix(b.Text, goalRoundPrefix)):
 				err = stream.SendThought(ctx, b.Text)
 			case m.Role == "user" && b.Type == "text" && !strings.HasPrefix(b.Text, runtimeContextPrefix):
 				err = stream.SendUserMessage(ctx, b.Text)
@@ -173,7 +187,7 @@ func (a *deepseekAgent) Prompt(ctx context.Context, params *acp1.PromptRequest) 
 		return nil, err
 	}
 	defer done()
-	reason, err := a.runTurn(turn, params.SessionID, sess, params.Prompt)
+	reason, err := a.handlePrompt(turn, params.SessionID, sess, params.Prompt)
 	a.save(turn, params.SessionID, sess)
 	if context.Cause(turn) == acp.ErrTurnCancelled {
 		reason, err = acp1.StopReasonCancelled, nil
@@ -184,20 +198,43 @@ func (a *deepseekAgent) Prompt(ctx context.Context, params *acp1.PromptRequest) 
 	return &acp1.PromptResponse{StopReason: reason, Usage: sess.acpUsage()}, nil
 }
 
-// runTurn answers the prompt: it calls the model, runs the tools it asks for,
-// and calls it again with their results until it answers without a tool call.
-//
-// Every tool_use in the history is followed by its tool_result, even when the
-// turn is cancelled halfway, or the next request would be rejected.
-func (a *deepseekAgent) runTurn(ctx context.Context, sessionID acp1.SessionID, sess *session, prompt []acp1.ContentBlock) (acp1.StopReason, error) {
-	if a.cfg.apiKey == "" {
-		return "", acp.InternalError("DEEPSEEK_API_KEY is not set; add it to the agent's environment in your editor settings")
+// handlePrompt runs a slash command, or answers the prompt with the model.
+func (a *deepseekAgent) handlePrompt(ctx context.Context, sessionID acp1.SessionID, sess *session, prompt []acp1.ContentBlock) (acp1.StopReason, error) {
+	if cmd, input, rest, ok := parseCommand(prompt); ok {
+		return cmd.run(a, ctx, &commandCall{
+			sessionID: sessionID, sess: sess, stream: acp1.NewSessionStream(a.client, sessionID),
+			input: input, rest: rest,
+		})
 	}
-	stream := acp1.NewSessionStream(a.client, sessionID)
-	// The settings and system prompt hold for the whole turn; a change made
-	// during it applies from the next prompt.
+	return a.promptTurn(ctx, sessionID, sess, prompt)
+}
+
+// promptTurn answers a prompt from the user, then works on an active goal.
+func (a *deepseekAgent) promptTurn(ctx context.Context, sessionID acp1.SessionID, sess *session, prompt []acp1.ContentBlock) (acp1.StopReason, error) {
+	if err := a.requireKey(); err != nil {
+		return "", err
+	}
+	model, _ := sess.settings()
+	sess.setTitleFrom(acp1.JoinTexts(prompt))
+	reason, err := a.runTurn(ctx, sessionID, sess, promptBlocks(prompt, lookupModel(model).images))
+	if err != nil {
+		return "", err
+	}
+	return a.continueGoal(ctx, sessionID, sess, reason)
+}
+
+func (a *deepseekAgent) requireKey() error {
+	if a.cfg.apiKey == "" {
+		return acp.InternalError("DEEPSEEK_API_KEY is not set; add it to the agent's environment in your editor settings")
+	}
+	return nil
+}
+
+// turnRequest builds the request settings for a turn from the session's
+// model and reasoning effort. They and the system prompt hold for the whole
+// turn; a change made during it applies from the next one.
+func (a *deepseekAgent) turnRequest(sess *session) (deepseek.Request, modelInfo) {
 	model, effort := sess.settings()
-	info := lookupModel(model)
 	req := deepseek.Request{
 		Model:     model,
 		MaxTokens: a.cfg.maxTokens,
@@ -210,19 +247,35 @@ func (a *deepseekAgent) runTurn(ctx context.Context, sessionID acp1.SessionID, s
 	} else {
 		req.OutputConfig = &deepseek.OutputConfig{Effort: effort}
 	}
+	return req, lookupModel(model)
+}
+
+// runTurn answers a user message of blocks: it calls the model, runs the tools it
+// asks for, and calls it again with their results until it answers without
+// a tool call.
+//
+// Every tool_use in the history is followed by its tool_result, even when the
+// turn is cancelled halfway, or the next request would be rejected.
+func (a *deepseekAgent) runTurn(ctx context.Context, sessionID acp1.SessionID, sess *session, blocks []deepseek.Block) (acp1.StopReason, error) {
+	if err := a.requireKey(); err != nil {
+		return "", err
+	}
+	stream := acp1.NewSessionStream(a.client, sessionID)
+	req, info := a.turnRequest(sess)
 	handler := deepseek.Handler{
 		OnText:     func(text string) error { return stream.SendText(ctx, text) },
 		OnThinking: func(text string) error { return stream.SendThought(ctx, text) },
 	}
 
-	sess.setTitleFrom(acp1.JoinTexts(prompt))
 	if err := a.maybeCompact(ctx, stream, sess, req, info, false); err != nil {
 		if ctx.Err() != nil {
 			return acp1.StopReasonCancelled, nil
 		}
 		return "", err
 	}
-	sess.commit(userMessage(sess, prompt, info.images))
+	// The message is made after any compaction, which restates the runtime
+	// context itself.
+	sess.commit(userTurn(sess, blocks))
 
 	for range a.cfg.maxSteps {
 		req.Messages = sess.messages()
@@ -309,16 +362,26 @@ func withoutToolCalls(m deepseek.Message) deepseek.Message {
 
 const runtimeContextPrefix = "<runtime-context>"
 
-// userMessage turns an ACP prompt into a user message. The first message
-// after the mode changes starts with a note of the new mode, so the system
-// prompt never changes and stays cached.
-func userMessage(sess *session, prompt []acp1.ContentBlock, images bool) deepseek.Message {
+// userTurn makes a user message of blocks. The first message after the
+// permission or plan mode changes starts with a note of the new runtime
+// context, so the system prompt never changes and stays cached.
+func userTurn(sess *session, blocks []deepseek.Block) deepseek.Message {
 	msg := deepseek.Message{Role: "user"}
-	if mode, changed := sess.modeChange(); changed {
+	if text, changed := sess.contextChange(); changed {
 		msg.Content = append(msg.Content, deepseek.TextBlock(fmt.Sprintf(
-			"%s\nCurrent runtime context. This snapshot supersedes earlier ones.\nPermission mode: %s\n</runtime-context>",
-			runtimeContextPrefix, modeContext[mode])))
+			"%s\nCurrent runtime context. This snapshot supersedes earlier ones.\n%s\n</runtime-context>",
+			runtimeContextPrefix, text)))
 	}
+	msg.Content = append(msg.Content, blocks...)
+	if len(msg.Content) == 0 {
+		msg.Content = append(msg.Content, deepseek.TextBlock("(empty prompt)"))
+	}
+	return msg
+}
+
+// promptBlocks turns an ACP prompt into content blocks for the model.
+func promptBlocks(prompt []acp1.ContentBlock, images bool) []deepseek.Block {
+	msg := deepseek.Message{Role: "user"}
 	for _, block := range prompt {
 		switch b := block.Variant().(type) {
 		case acp1.ContentBlockText:
@@ -340,10 +403,7 @@ func userMessage(sess *session, prompt []acp1.ContentBlock, images bool) deepsee
 			msg.Content = append(msg.Content, deepseek.TextBlock(describeLink(b)))
 		}
 	}
-	if len(msg.Content) == 0 {
-		msg.Content = append(msg.Content, deepseek.TextBlock("(empty prompt)"))
-	}
-	return msg
+	return msg.Content
 }
 
 // describeLink mentions a linked resource; a linked file is named by its path
@@ -377,6 +437,7 @@ const toolGuidance = `Use your tools to inspect and change the project instead o
 - Use the glob tool, not shell find, to find files by name, and the grep tool, not shell grep or rg, to search file contents.
 - Use bash for builds, tests, git and other commands. Each call runs in a fresh shell; pass workdir instead of using cd. Check the [exit code: N] marker on every bash result and investigate failures before moving on.
 - For multi-step work, keep a plan with todo_write and update it as you go.
+- For a long-running objective that needs many turns, create a goal with create_goal; the session then keeps working on it in automatic rounds until you mark it complete with update_goal.
 - The user may reject a change or a command. If so, do not retry it another way; ask the user or adjust your approach.
 Be concise. Reference code as path:line.
 `
