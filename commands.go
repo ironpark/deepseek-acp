@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/ironpark/acp-go/acp1"
-
-	"github.com/ironpark/deepseek-acp/internal/deepseek"
 )
 
 // Slash commands, after the harness's human commands. A command runs without
@@ -137,11 +135,7 @@ func (a *deepseekAgent) permissionCommand(ctx context.Context, c *commandCall) (
 	if !validMode(mode) {
 		return c.reply(ctx, fmt.Sprintf("Unknown mode %q (available: %s)", c.input, available))
 	}
-	c.sess.setMode(mode)
-	if err := c.stream.SendModeUpdate(ctx, mode); err != nil {
-		return "", err
-	}
-	if err := c.stream.SendConfigUpdate(ctx, c.sess.SessionConfigOptions()); err != nil {
+	if err := a.switchMode(ctx, c.stream, c.sess, mode); err != nil {
 		return "", err
 	}
 	return c.reply(ctx, fmt.Sprintf("Permission mode: %s.", mode))
@@ -210,37 +204,4 @@ func (a *deepseekAgent) goalCommand(ctx context.Context, c *commandCall) (acp1.S
 		return "", err
 	}
 	return a.continueGoal(ctx, c.sessionID, sess, acp1.StopReasonEndTurn)
-}
-
-// continueGoal runs automatic goal rounds after a turn that ended normally,
-// while the goal is active and armed and has rounds left.
-func (a *deepseekAgent) continueGoal(ctx context.Context, sessionID acp1.SessionID, sess *session, reason acp1.StopReason) (acp1.StopReason, error) {
-	stream := acp1.NewSessionStream(a.client, sessionID)
-	ran := false
-	for reason == acp1.StopReasonEndTurn && ctx.Err() == nil {
-		block, ok := sess.nextGoalRound()
-		if !ok {
-			break
-		}
-		if err := stream.SendThought(ctx, block.Text); err != nil {
-			return "", err
-		}
-		ran = true
-		sess.setGoalRound(true)
-		var err error
-		reason, err = a.runTurn(ctx, sessionID, sess, []deepseek.Block{block})
-		sess.setGoalRound(false)
-		a.save(ctx, sessionID, sess)
-		if err != nil {
-			return "", err
-		}
-	}
-	// Only a goal that these rounds blocked is reported, not one that was
-	// already blocked before the prompt.
-	if g := sess.currentGoal(); ran && g != nil && g.Status == goalBlocked && reason == acp1.StopReasonEndTurn {
-		if err := stream.SendText(ctx, "\n\nGoal blocked: "+g.BlockedReason); err != nil {
-			return "", err
-		}
-	}
-	return reason, nil
 }

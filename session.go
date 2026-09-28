@@ -371,20 +371,29 @@ func (s *session) SessionConfigOptions() []acp1.SessionConfigOption {
 	}
 }
 
+// switchMode changes the session's permission mode and tells the client,
+// both as the session mode and as the mode config option, so the two agree
+// whichever way the mode changed.
+func (a *deepseekAgent) switchMode(ctx context.Context, stream *acp1.SessionStream, sess *session, mode acp1.SessionModeID) error {
+	if !validMode(mode) {
+		return acp.InvalidParams(fmt.Sprintf("unknown mode %q", mode))
+	}
+	sess.setMode(mode)
+	if err := stream.SendModeUpdate(ctx, mode); err != nil {
+		return err
+	}
+	return stream.SendConfigUpdate(ctx, sess.SessionConfigOptions())
+}
+
 func (a *deepseekAgent) SetSessionMode(ctx context.Context, params *acp1.SetSessionModeRequest) (*acp1.SetSessionModeResponse, error) {
 	sess, err := a.Lookup(ctx, params.SessionID)
 	if err != nil {
 		return nil, err
 	}
-	if !validMode(params.ModeID) {
-		return nil, acp.InvalidParams(fmt.Sprintf("unknown mode %q", params.ModeID))
-	}
-	sess.setMode(params.ModeID)
-	a.save(ctx, params.SessionID, sess)
-	// Keep the permission mode config option in step.
-	if err := acp1.NewSessionStream(a.client, params.SessionID).SendConfigUpdate(ctx, sess.SessionConfigOptions()); err != nil {
+	if err := a.switchMode(ctx, acp1.NewSessionStream(a.client, params.SessionID), sess, params.ModeID); err != nil {
 		return nil, err
 	}
+	a.save(ctx, params.SessionID, sess)
 	return &acp1.SetSessionModeResponse{}, nil
 }
 
@@ -400,13 +409,7 @@ func (a *deepseekAgent) SetSessionConfigOption(ctx context.Context, params *acp1
 	value := string(req.Value)
 	switch req.ConfigID {
 	case modeOption:
-		mode := acp1.SessionModeID(value)
-		if !validMode(mode) {
-			return nil, acp.InvalidParams(fmt.Sprintf("unknown mode %q", value))
-		}
-		sess.setMode(mode)
-		// Keep the session mode in step, for clients that show modes.
-		if err := acp1.NewSessionStream(a.client, req.SessionID).SendModeUpdate(ctx, mode); err != nil {
+		if err := a.switchMode(ctx, acp1.NewSessionStream(a.client, req.SessionID), sess, acp1.SessionModeID(value)); err != nil {
 			return nil, err
 		}
 	case modelOption:

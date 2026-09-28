@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/ironpark/acp-go/acp1"
 
 	"github.com/ironpark/deepseek-acp/internal/deepseek"
 )
@@ -179,6 +182,39 @@ func goalRoundPrompt(g *goal) string {
 		"goal, and mark it complete with update_goal. If work remains, leave the goal active for the next round. " +
 		fmt.Sprintf("Mark it blocked only when the same condition has blocked progress for at least %d rounds.\n", minBlockedRounds) +
 		"</goal_round>"
+}
+
+// continueGoal runs automatic goal rounds after a turn that ended normally,
+// while the goal is active and armed and has rounds left.
+func (a *deepseekAgent) continueGoal(ctx context.Context, sessionID acp1.SessionID, sess *session, reason acp1.StopReason) (acp1.StopReason, error) {
+	stream := acp1.NewSessionStream(a.client, sessionID)
+	ran := false
+	for reason == acp1.StopReasonEndTurn && ctx.Err() == nil {
+		block, ok := sess.nextGoalRound()
+		if !ok {
+			break
+		}
+		if err := stream.SendThought(ctx, block.Text); err != nil {
+			return "", err
+		}
+		ran = true
+		sess.setGoalRound(true)
+		var err error
+		reason, err = a.runTurn(ctx, sessionID, sess, []deepseek.Block{block})
+		sess.setGoalRound(false)
+		a.save(ctx, sessionID, sess)
+		if err != nil {
+			return "", err
+		}
+	}
+	// Only a goal that these rounds blocked is reported, not one that was
+	// already blocked before the prompt.
+	if g := sess.currentGoal(); ran && g != nil && g.Status == goalBlocked && reason == acp1.StopReasonEndTurn {
+		if err := stream.SendText(ctx, "\n\nGoal blocked: "+g.BlockedReason); err != nil {
+			return "", err
+		}
+	}
+	return reason, nil
 }
 
 // The goal tools, after the harness's dsh-tool-goal. The model's view has no
