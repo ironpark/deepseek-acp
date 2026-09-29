@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/ironpark/acp-go/acp1"
 )
@@ -36,7 +35,10 @@ var commands = []command{
 	{name: "goal", description: "Set or view the goal for a long-running task", hint: "[<objective>|clear|edit <objective>|pause|resume]", run: (*deepseekAgent).goalCommand},
 }
 
-func availableCommands() []acp1.AvailableCommand {
+// AvailableCommands lists the slash commands; the embedded manager sends
+// them after session/new and session/resume, and LoadSession while it
+// replays the session.
+func (*session) AvailableCommands() []acp1.AvailableCommand {
 	list := make([]acp1.AvailableCommand, 0, len(commands))
 	for _, c := range commands {
 		ac := acp1.AvailableCommand{Name: c.name, Description: c.description}
@@ -46,22 +48,6 @@ func availableCommands() []acp1.AvailableCommand {
 		list = append(list, ac)
 	}
 	return list
-}
-
-// commandAdvertiseDelay lets a session/new or session/resume response reach
-// the client before the commands for its session do.
-const commandAdvertiseDelay = 50 * time.Millisecond
-
-// advertiseCommands sends the session's commands once the response that
-// creates or resumes it has gone out.
-func (a *deepseekAgent) advertiseCommands(id acp1.SessionID) {
-	time.AfterFunc(commandAdvertiseDelay, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := acp1.NewSessionStream(a.client, id).SendCommands(ctx, availableCommands()); err != nil {
-			a.logger.Warn("advertise commands", "session", id, "error", err)
-		}
-	})
 }
 
 // parseCommand finds the command a prompt starts with, if any. A prompt

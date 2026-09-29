@@ -352,21 +352,18 @@ func (s *session) SessionConfigOptions() []acp1.SessionConfigOption {
 	for _, m := range modes {
 		modeValues = append(modeValues, acp1.SessionConfigSelectOption{Value: acp1.SessionConfigValueID(m.ID), Name: m.Name, Description: m.Description})
 	}
-	modeChoices, _ := acp1.NewSessionConfigSelectOptions(modeValues)
-	modelChoices, _ := acp1.NewSessionConfigSelectOptions(models)
-	effortChoices, _ := acp1.NewSessionConfigSelectOptions(efforts)
 	return []acp1.SessionConfigOption{
 		acp1.NewSessionConfigOption(acp1.SessionConfigOptionSelect{
 			ID: modeOption, Name: "Permission Mode", CurrentValue: acp1.SessionConfigValueID(s.currentMode()),
-			Options: modeChoices, Category: new(acp1.SessionConfigOptionCategoryMode),
+			Options: acp1.SelectOptions(modeValues...), Category: new(acp1.SessionConfigOptionCategoryMode),
 		}),
 		acp1.NewSessionConfigOption(acp1.SessionConfigOptionSelect{
 			ID: modelOption, Name: "Model", CurrentValue: acp1.SessionConfigValueID(model),
-			Options: modelChoices, Category: new(acp1.SessionConfigOptionCategoryModel),
+			Options: acp1.SelectOptions(models...), Category: new(acp1.SessionConfigOptionCategoryModel),
 		}),
 		acp1.NewSessionConfigOption(acp1.SessionConfigOptionSelect{
 			ID: effortOption, Name: "Reasoning Effort", CurrentValue: acp1.SessionConfigValueID(effort),
-			Options: effortChoices, Category: new(acp1.SessionConfigOptionCategoryThoughtLevel),
+			Options: acp1.SelectOptions(efforts...), Category: new(acp1.SessionConfigOptionCategoryThoughtLevel),
 		}),
 	}
 }
@@ -398,8 +395,8 @@ func (a *deepseekAgent) SetSessionMode(ctx context.Context, params *acp1.SetSess
 }
 
 func (a *deepseekAgent) SetSessionConfigOption(ctx context.Context, params *acp1.SetSessionConfigOptionRequest) (*acp1.SetSessionConfigOptionResponse, error) {
-	req, ok := params.As[acp1.SetSessionConfigOptionRequestUntagged]()
-	if !ok {
+	req, ok := acp1.ConfigChangeOf(params)
+	if !ok || req.Boolean != nil {
 		return nil, acp.InvalidParams("expected a select value")
 	}
 	sess, err := a.Lookup(ctx, req.SessionID)
@@ -511,10 +508,11 @@ func (a *deepseekAgent) ListSessions(ctx context.Context, params *acp1.ListSessi
 	return a.List(ctx, params)
 }
 
-// save writes the session to the store. A failure is logged rather than
-// failing the request, and a cancelled turn must still be saved.
+// save writes a session changed outside a turn to the store; the manager
+// saves the changes turns make. A failure is logged rather than failing the
+// request that changed the session.
 func (a *deepseekAgent) save(ctx context.Context, id acp1.SessionID, sess *session) {
-	if err := a.Store().Set(context.WithoutCancel(ctx), id, sess); err != nil {
+	if err := a.Save(ctx, id, sess); err != nil {
 		a.logger.Error("save session", "session", id, "error", err)
 	}
 }

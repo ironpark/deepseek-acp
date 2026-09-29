@@ -22,32 +22,28 @@ func newAgent(cfg *config, store acp1.SessionStore[*session], llm *deepseek.Clie
 	manager := acp1.NewSessionManager(store,
 		func(_ context.Context, params *acp1.NewSessionRequest) (acp1.SessionID, *session, error) {
 			return acp1.GenerateSessionID(), newSession(params.Cwd, cfg), nil
-		})
+		},
+		// A turn always leaves the history whole, even when cancelled, so the
+		// session is saved whenever one ends.
+		acp1.WithAutoSave(func(id acp1.SessionID, err error) {
+			logger.Error("save session", "session", id, "error", err)
+		}))
 	return func(c *acp1.AgentSideConnection) acp1.Agent {
 		return &deepseekAgent{SessionManager: manager, client: c, llm: llm, cfg: cfg, logger: logger}
 	}
 }
 
-// deepseekAgent embeds a SessionManager for the session lifecycle and turn
-// cancellation, and runs each prompt as a DeepSeek tool loop.
+// deepseekAgent embeds a SessionManager for the session lifecycle, turn
+// cancellation and saving, and runs each prompt as a DeepSeek tool loop.
 type deepseekAgent struct {
 	*acp1.SessionManager[*session]
 	client *acp1.AgentSideConnection
 	llm    *deepseek.Client
 	cfg    *config
 	logger *slog.Logger
-
-	// What the client can do for the agent, from its initialize request.
-	// Without them, files and commands are handled locally.
-	clientRead, clientWrite, clientTerminal bool
 }
 
-func (a *deepseekAgent) Initialize(_ context.Context, params *acp1.InitializeRequest) (*acp1.InitializeResponse, error) {
-	caps := params.GetClientCapabilities()
-	a.clientRead = caps.GetFS().GetReadTextFile()
-	a.clientWrite = caps.GetFS().GetWriteTextFile()
-	a.clientTerminal = caps.GetTerminal()
-
+func (a *deepseekAgent) Initialize(context.Context, *acp1.InitializeRequest) (*acp1.InitializeResponse, error) {
 	agentCaps := acp1.CapabilitiesOf(a)
 	agentCaps.PromptCapabilities = &acp1.PromptCapabilities{Image: new(true), EmbeddedContext: new(true)}
 	return &acp1.InitializeResponse{
@@ -55,16 +51,6 @@ func (a *deepseekAgent) Initialize(_ context.Context, params *acp1.InitializeReq
 		AgentCapabilities: agentCaps,
 		AgentInfo:         &acp1.Implementation{Name: "deepseek-acp", Title: new("DeepSeek"), Version: version},
 	}, nil
-}
-
-// NewSession creates the session through the manager, then advertises its
-// slash commands.
-func (a *deepseekAgent) NewSession(ctx context.Context, params *acp1.NewSessionRequest) (*acp1.NewSessionResponse, error) {
-	resp, err := a.SessionManager.NewSession(ctx, params)
-	if err == nil {
-		a.advertiseCommands(resp.SessionID)
-	}
-	return resp, err
 }
 
 // LoadSession replays the conversation to the client: the user's messages,
@@ -84,14 +70,15 @@ func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessio
 	if err := a.sendContextUsage(ctx, stream, sess); err != nil {
 		return nil, err
 	}
-	if err := stream.SendCommands(ctx, availableCommands()); err != nil {
+	if err := stream.SendCommands(ctx, sess.AvailableCommands()); err != nil {
 		return nil, err
 	}
 	return &acp1.LoadSessionResponse{Modes: sess.SessionModes(), ConfigOptions: sess.SessionConfigOptions()}, nil
 }
 
-// ResumeSession resumes the session through the manager, restores the
-// client's context usage display, and advertises the slash commands.
+// ResumeSession resumes the session through the manager, which also
+// advertises the slash commands, and restores the client's context usage
+// display.
 func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSessionRequest) (*acp1.ResumeSessionResponse, error) {
 	resp, err := a.SessionManager.ResumeSession(ctx, params)
 	if err != nil {
@@ -102,7 +89,6 @@ func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSe
 			return nil, err
 		}
 	}
-	a.advertiseCommands(params.SessionID)
 	return resp, nil
 }
 
@@ -175,27 +161,14 @@ func (a *deepseekAgent) replayToolCall(ctx context.Context, stream *acp1.Session
 }
 
 // Prompt runs the turn under the embedded manager, whose CancelSession
-// cancels the turn's context, which also aborts the request to DeepSeek. The
-// response reports the session's token usage.
+// cancels the turn's context, which also aborts the request to DeepSeek, and
+// which saves the session when the turn ends. The response reports the
+// session's token usage.
 func (a *deepseekAgent) Prompt(ctx context.Context, params *acp1.PromptRequest) (*acp1.PromptResponse, error) {
-	sess, err := a.Lookup(ctx, params.SessionID)
-	if err != nil {
-		return nil, err
-	}
-	turn, done, err := a.BeginTurn(ctx, params.SessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	reason, err := a.handlePrompt(turn, params.SessionID, sess, params.Prompt)
-	a.save(turn, params.SessionID, sess)
-	if context.Cause(turn) == acp.ErrTurnCancelled {
-		reason, err = acp1.StopReasonCancelled, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &acp1.PromptResponse{StopReason: reason, Usage: sess.acpUsage()}, nil
+	return a.RunTurnResponse(ctx, params.SessionID, func(ctx context.Context, sess *session) (*acp1.PromptResponse, error) {
+		reason, err := a.handlePrompt(ctx, params.SessionID, sess, params.Prompt)
+		return &acp1.PromptResponse{StopReason: reason, Usage: sess.acpUsage()}, err
+	})
 }
 
 // handlePrompt runs a slash command, or answers the prompt with the model.

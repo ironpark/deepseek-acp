@@ -113,6 +113,9 @@ type action struct {
 	// hidden actions are not shown as tool calls, like todo_write, which
 	// shows as the plan.
 	hidden bool
+	// gated actions may wait for the user's permission, so they show as
+	// pending until they run.
+	gated bool
 	// run does the work and returns the result for the model and the content
 	// to show the client. With an error, the tool call fails, and the model
 	// gets the result if there is one, the error otherwise.
@@ -144,7 +147,11 @@ func (a *deepseekAgent) runTool(ctx context.Context, stream *acp1.SessionStream,
 		return result, false, err
 	}
 
-	if err := stream.StartToolCall(ctx, id, act.title, act.kind,
+	show := stream.StartToolCall
+	if act.gated {
+		show = stream.ProposeToolCall
+	}
+	if err := show(ctx, id, act.title, act.kind,
 		acp1.WithLocations(act.locations...), acp1.WithRawInput(call.Input)); err != nil {
 		return "", false, err
 	}
@@ -200,6 +207,7 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 		return &action{
 			title:     "Write " + sess.display(path),
 			kind:      acp1.ToolKindEdit,
+			gated:     true,
 			locations: []acp1.ToolCallLocation{{Path: path}},
 			run: func(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
 				return a.writeFile(ctx, stream, sess, id, path, args.Content)
@@ -220,6 +228,7 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 		return &action{
 			title:     "Edit " + sess.display(path),
 			kind:      acp1.ToolKindEdit,
+			gated:     true,
 			locations: []acp1.ToolCallLocation{{Path: path}},
 			run: func(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
 				return a.editFile(ctx, stream, sess, id, path, args.OldString, args.NewString, args.ReplaceAll)
@@ -292,6 +301,7 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 		return &action{
 			title: title,
 			kind:  acp1.ToolKindExecute,
+			gated: true,
 			run: func(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
 				return a.runBash(ctx, stream, sess, id, args.Command, workdir, timeout)
 			},
@@ -337,6 +347,7 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 		return &action{
 			title: "Plan: " + planTitle(args.Plan),
 			kind:  acp1.ToolKindSwitchMode,
+			gated: true,
 			run: func(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID) (string, []acp1.ToolCallContent, error) {
 				return a.exitPlanMode(ctx, stream, sess, id, args.Plan)
 			},
@@ -436,7 +447,7 @@ func oneLine(s string) string {
 // readText reads a file through the client when it can, which includes
 // unsaved changes in the editor, and from disk otherwise.
 func (a *deepseekAgent) readText(ctx context.Context, stream *acp1.SessionStream, path string) (string, error) {
-	if a.clientRead {
+	if a.client.ClientCapabilities().GetFS().GetReadTextFile() {
 		return stream.ReadTextFile(ctx, path)
 	}
 	data, err := os.ReadFile(path)
@@ -449,7 +460,7 @@ func (a *deepseekAgent) writeText(ctx context.Context, stream *acp1.SessionStrea
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if a.clientWrite {
+	if a.client.ClientCapabilities().GetFS().GetWriteTextFile() {
 		return stream.WriteTextFile(ctx, path, content)
 	}
 	mode := os.FileMode(0o644)
@@ -575,51 +586,31 @@ func (a *deepseekAgent) runBash(ctx context.Context, stream *acp1.SessionStream,
 	if err := a.permit(ctx, stream, sess, id, bashTool.Name, false, acp1.ToolText("```sh\n"+command+"\n```")); err != nil {
 		return "", nil, err
 	}
-	if a.clientTerminal {
+	if a.client.ClientCapabilities().GetTerminal() {
 		return a.runInTerminal(ctx, stream, id, command, workdir, timeout)
-	}
-	if err := stream.UpdateToolCallStatus(ctx, id, acp1.ToolCallStatusInProgress); err != nil {
-		return "", nil, err
 	}
 	return a.runLocally(ctx, command, workdir, timeout)
 }
 
 func (a *deepseekAgent) runInTerminal(ctx context.Context, stream *acp1.SessionStream, id acp1.ToolCallID, command, workdir string, timeout time.Duration) (string, []acp1.ToolCallContent, error) {
-	terminal, err := stream.NewTerminal(ctx, acp1.CreateTerminalRequest{
+	run, err := stream.RunTerminal(ctx, id, acp1.CreateTerminalRequest{
 		Command:         a.cfg.shell,
 		Args:            []string{"-c", command},
 		Cwd:             &workdir,
 		OutputByteLimit: new(uint64(outputLimit)),
-	})
-	if err != nil {
+	}, timeout)
+	if run == nil {
 		return "", nil, err
 	}
-	// Release frees the terminal; the client still shows its output.
-	defer terminal.Release(context.WithoutCancel(ctx))
-	content := []acp1.ToolCallContent{acp1.ToolTerminal(terminal.ID)}
-	if err := stream.UpdateToolCallStatus(ctx, id, acp1.ToolCallStatusInProgress, acp1.WithToolContent(content...)); err != nil {
-		return "", content, err
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	exit, waitErr := terminal.WaitForExit(waitCtx)
-	var timedOut time.Duration
-	if waitErr != nil {
-		_ = terminal.Kill(context.WithoutCancel(ctx))
-		if ctx.Err() != nil || waitCtx.Err() == nil {
-			return "", content, waitErr
-		}
-		timedOut = timeout
-	}
-	output, err := terminal.CurrentOutput(context.WithoutCancel(ctx))
+	// The client keeps showing a released terminal's output, also for a
+	// command the cancelled turn killed.
+	content := []acp1.ToolCallContent{acp1.ToolTerminal(run.TerminalID)}
 	if err != nil {
 		return "", content, err
 	}
-
 	var code *int
 	var signal string
-	if exit != nil {
+	if exit := run.ExitStatus; exit != nil {
 		if exit.ExitCode != nil {
 			code = new(int(*exit.ExitCode))
 		}
@@ -627,7 +618,11 @@ func (a *deepseekAgent) runInTerminal(ctx context.Context, stream *acp1.SessionS
 			signal = *exit.Signal
 		}
 	}
-	result, err := commandResult(output.Output, output.Truncated, code, signal, timedOut)
+	var timedOut time.Duration
+	if run.TimedOut {
+		timedOut = timeout
+	}
+	result, err := commandResult(run.Output, run.Truncated, code, signal, timedOut)
 	return result, content, err
 }
 
@@ -720,6 +715,15 @@ func commandResult(output string, truncated bool, code *int, signal string, time
 // permit decides whether a tool call may change files (edit) or run a
 // command, by the session's mode, asking the user when the mode says to.
 func (a *deepseekAgent) permit(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, tool string, edit bool, content ...acp1.ToolCallContent) error {
+	if err := a.authorize(ctx, stream, sess, id, tool, edit, content...); err != nil {
+		return err
+	}
+	// The call was pending while it might wait for the user; now it runs.
+	return stream.UpdateToolCallStatus(ctx, id, acp1.ToolCallStatusInProgress)
+}
+
+// authorize is permit's decision.
+func (a *deepseekAgent) authorize(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, tool string, edit bool, content ...acp1.ToolCallContent) error {
 	if edit && sess.inPlanMode() {
 		return errors.New("refused: plan mode is on; present the plan with exit_plan_mode instead of changing files")
 	}

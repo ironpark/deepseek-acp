@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,12 +34,6 @@ func prompt(t *testing.T, conn *acp1.ClientSideConnection, id acp1.SessionID, te
 	return resp
 }
 
-func (c *testClient) seen(update string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Contains(c.updates, update)
-}
-
 func TestParseCommand(t *testing.T) {
 	tests := []struct {
 		text, name, input string
@@ -67,18 +61,18 @@ func TestCommandsAdvertisedAndPermission(t *testing.T) {
 	fake := &fakeDeepSeek{}
 	conn, client, store, s := startAgent(t, t.TempDir(), fake)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for !client.seen("available_commands_update") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !client.seen("available_commands_update") {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if _, err := client.WaitFor(ctx, func(n *acp1.SessionNotification) bool {
+		return n.SessionID == s.SessionID && n.Update.Tag() == "available_commands_update"
+	}); err != nil {
 		t.Error("commands were not advertised after session/new")
 	}
 
 	prompt(t, conn, s.SessionID, "/permission workspace-write")
 	sess, _, _ := store.Get(t.Context(), s.SessionID)
 	if sess.currentMode() != acceptEditsMode || !client.seen("current_mode_update") {
-		t.Errorf("mode = %s, updates %v", sess.currentMode(), client.updates)
+		t.Errorf("mode = %s, updates %v", sess.currentMode(), client.tags())
 	}
 	if len(fake.requests) != 0 {
 		t.Errorf("a command reached the model: %d requests", len(fake.requests))
@@ -112,8 +106,8 @@ func TestPlanMode(t *testing.T) {
 		t.Errorf("exit_plan_mode = %+v, want approved", results[1])
 	}
 	sess, _, _ := store.Get(t.Context(), s.SessionID)
-	if sess.inPlanMode() || client.permissions != 1 {
-		t.Errorf("plan mode = %v, permission requests = %d; want off, 1", sess.inPlanMode(), client.permissions)
+	if n := len(client.Permissions()); sess.inPlanMode() || n != 1 {
+		t.Errorf("plan mode = %v, permission requests = %d; want off, 1", sess.inPlanMode(), n)
 	}
 }
 
@@ -139,8 +133,8 @@ func TestGoalRounds(t *testing.T) {
 	if g := sess.currentGoal(); g == nil || g.Status != goalComplete || g.Rounds != 2 {
 		t.Errorf("goal = %+v", g)
 	}
-	if !strings.HasPrefix(client.text.String(), "Goal set.") {
-		t.Errorf("reply = %q", client.text.String())
+	if text := client.Text(s.SessionID); !strings.HasPrefix(text, "Goal set.") {
+		t.Errorf("reply = %q", text)
 	}
 }
 

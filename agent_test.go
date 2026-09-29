@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json/v2"
 	"fmt"
 	"io"
@@ -10,11 +9,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/ironpark/acp-go/acp1"
+	"github.com/ironpark/acp-go/acp1/acp1test"
 
 	"github.com/ironpark/deepseek-acp/internal/deepseek"
 )
@@ -59,33 +60,20 @@ func (f *fakeDeepSeek) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, resp)
 }
 
-// testClient is an ACP client that records updates and allows every
-// permission request.
-type testClient struct {
-	mu          sync.Mutex
-	updates     []string
-	text        strings.Builder
-	permissions int
-}
+// testClient records the updates it receives and allows every permission
+// request once.
+type testClient struct{ acp1test.Client }
 
-func (c *testClient) SessionUpdate(_ context.Context, n *acp1.SessionNotification) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.updates = append(c.updates, n.Update.Tag())
-	if chunk, ok := n.Update.As[acp1.SessionUpdateAgentMessageChunk](); ok {
-		if text, ok := acp1.TextOf(chunk.Content); ok {
-			c.text.WriteString(text)
-		}
+// tags lists the kinds of the updates received so far, in order.
+func (c *testClient) tags() []string {
+	var tags []string
+	for _, n := range c.Updates() {
+		tags = append(tags, n.Update.Tag())
 	}
-	return nil
+	return tags
 }
 
-func (c *testClient) RequestPermission(_ context.Context, p *acp1.RequestPermissionRequest) (*acp1.RequestPermissionResponse, error) {
-	c.mu.Lock()
-	c.permissions++
-	c.mu.Unlock()
-	return acp1.PermissionSelected(p.Options[0].OptionID), nil
-}
+func (c *testClient) seen(tag string) bool { return slices.Contains(c.tags(), tag) }
 
 // startAgent connects a test client to an agent backed by fake, and opens a
 // session in dir.
@@ -105,7 +93,7 @@ func startAgent(t *testing.T, dir string, fake *fakeDeepSeek) (*acp1.ClientSideC
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	llm := &deepseek.Client{BaseURL: cfg.baseURL, APIKey: cfg.apiKey}
 	client := &testClient{}
-	_, conn := acp1.Pipe(t.Context(), newAgent(cfg, store, llm, logger), func(*acp1.ClientSideConnection) acp1.Client { return client })
+	conn := acp1test.Connect(t, newAgent(cfg, store, llm, logger), client)
 	if _, err := conn.Initialize(t.Context(), &acp1.InitializeRequest{ProtocolVersion: acp1.ProtocolVersion}); err != nil {
 		t.Fatal(err)
 	}
@@ -169,8 +157,8 @@ func TestCompaction(t *testing.T) {
 		!strings.Contains(next[0].Content[0].Text, "SUMMARY OF EARLIER WORK") || next[0].Content[1].Text != "next question" {
 		t.Errorf("request after compaction = %+v", next)
 	}
-	if !strings.Contains(strings.Join(client.updates, ","), "tool_call") {
-		t.Errorf("compaction not shown: %v", client.updates)
+	if !client.seen("tool_call") {
+		t.Errorf("compaction not shown: %v", client.tags())
 	}
 	sess, _, _ = store.Get(t.Context(), newResp.SessionID)
 	if got := sess.contextTokens(); got != 2_010 {
@@ -224,17 +212,29 @@ func TestPromptRunsToolLoop(t *testing.T) {
 	if err != nil || string(data) != "hi\n" {
 		t.Errorf("hello.txt = %q, %v; want %q", data, err, "hi\n")
 	}
-	if client.permissions != 1 {
-		t.Errorf("permission requests = %d, want 1", client.permissions)
+	if n := len(client.Permissions()); n != 1 {
+		t.Errorf("permission requests = %d, want 1", n)
 	}
-	if got := client.text.String(); got != "Wrote hello.txt." {
+	if got := client.Text(newResp.SessionID); got != "Wrote hello.txt." {
 		t.Errorf("streamed text = %q", got)
 	}
-	updates := strings.Join(client.updates, ",")
 	for _, want := range []string{"agent_thought_chunk", "tool_call", "tool_call_update", "agent_message_chunk", "usage_update"} {
-		if !strings.Contains(updates, want) {
-			t.Errorf("updates %s: missing %s", updates, want)
+		if !client.seen(want) {
+			t.Errorf("updates %v: missing %s", client.tags(), want)
 		}
+	}
+	// The write waits for permission as a pending call, then runs.
+	var statuses []acp1.ToolCallStatus
+	for _, n := range client.Updates() {
+		if call, ok := n.Update.As[acp1.SessionUpdateToolCall](); ok {
+			statuses = append(statuses, call.GetStatus())
+		}
+		if call, ok := n.Update.As[acp1.SessionUpdateToolCallUpdate](); ok {
+			statuses = append(statuses, call.GetStatus())
+		}
+	}
+	if want := []acp1.ToolCallStatus{acp1.ToolCallStatusPending, acp1.ToolCallStatusInProgress, acp1.ToolCallStatusCompleted}; !slices.Equal(statuses, want) {
+		t.Errorf("tool call statuses = %v, want %v", statuses, want)
 	}
 
 	// The second request replays the thinking with its signature and pairs
