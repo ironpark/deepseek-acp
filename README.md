@@ -14,6 +14,9 @@ A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentcli
   shows diffs, unsaved buffers and live terminals — and run locally otherwise.
 - Permission modes: `read-only`, `ask` (default), `accept-edits`, `full-access`. They can be picked like the model and
   reasoning effort, which are config options too; the mode is offered both as a config option and as an ACP session mode.
+  A permission request can allow or reject once or always, or switch the session to `full-access`. "Always" remembers a
+  file tool, or a command by its program (`ls`) or subcommand (`go test`, which also covers `go test ./...`); a command
+  with pipes, redirections, `$` expansions or several commands is remembered only as written.
 - Sessions are saved to disk and support `session/list`, `load`, `resume`, `close`, `delete`.
 - `AGENTS.md` (or `CLAUDE.md`) in the working directory is added to the system prompt.
 - Reports context window usage (`usage_update`, also restored on `session/load` and `resume`) and the session's token

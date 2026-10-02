@@ -532,7 +532,7 @@ func (a *deepseekAgent) writeFile(ctx context.Context, stream *acp1.SessionStrea
 		oldText = &old
 	}
 	diff := []acp1.ToolCallContent{acp1.ToolDiff(path, oldText, content)}
-	if err := a.permit(ctx, stream, sess, id, writeTool.Name, true, diff...); err != nil {
+	if err := a.permit(ctx, stream, sess, id, toolRule(writeTool.Name), true, diff...); err != nil {
 		return "", diff, err
 	}
 	if err := a.writeText(ctx, stream, path, content); err != nil {
@@ -566,7 +566,7 @@ func (a *deepseekAgent) editFile(ctx context.Context, stream *acp1.SessionStream
 	updated := strings.ReplaceAll(old, oldString, newString)
 
 	diff := []acp1.ToolCallContent{acp1.ToolDiff(path, &old, updated)}
-	if err := a.permit(ctx, stream, sess, id, editTool.Name, true, diff...); err != nil {
+	if err := a.permit(ctx, stream, sess, id, toolRule(editTool.Name), true, diff...); err != nil {
 		return "", diff, err
 	}
 	if err := a.writeText(ctx, stream, path, updated); err != nil {
@@ -583,7 +583,7 @@ func (a *deepseekAgent) editFile(ctx context.Context, stream *acp1.SessionStream
 // runBash runs a command in a terminal the client owns when it can, so the
 // client shows the output as it runs, and locally otherwise.
 func (a *deepseekAgent) runBash(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, command, workdir string, timeout time.Duration) (string, []acp1.ToolCallContent, error) {
-	if err := a.permit(ctx, stream, sess, id, bashTool.Name, false, acp1.ToolText("```sh\n"+command+"\n```")); err != nil {
+	if err := a.permit(ctx, stream, sess, id, commandRule(command), false, acp1.ToolText("```sh\n"+command+"\n```")); err != nil {
 		return "", nil, err
 	}
 	if a.client.ClientCapabilities().GetTerminal() {
@@ -708,50 +708,4 @@ func commandResult(output string, truncated bool, code *int, signal string, time
 		return b.String(), nil
 	}
 	return b.String(), errCommandFailed
-}
-
-// Permissions.
-
-// permit decides whether a tool call may change files (edit) or run a
-// command, by the session's mode, asking the user when the mode says to.
-func (a *deepseekAgent) permit(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, tool string, edit bool, content ...acp1.ToolCallContent) error {
-	if err := a.authorize(ctx, stream, sess, id, tool, edit, content...); err != nil {
-		return err
-	}
-	// The call was pending while it might wait for the user; now it runs.
-	return stream.UpdateToolCallStatus(ctx, id, acp1.ToolCallStatusInProgress)
-}
-
-// authorize is permit's decision.
-func (a *deepseekAgent) authorize(ctx context.Context, stream *acp1.SessionStream, sess *session, id acp1.ToolCallID, tool string, edit bool, content ...acp1.ToolCallContent) error {
-	if edit && sess.inPlanMode() {
-		return errors.New("refused: plan mode is on; present the plan with exit_plan_mode instead of changing files")
-	}
-	switch mode := sess.currentMode(); {
-	case mode == fullAccessMode:
-		return nil
-	case mode == readOnlyMode && edit:
-		return errors.New("refused: the session is in read-only mode; the user must switch modes to allow file changes")
-	case mode == acceptEditsMode && edit:
-		return nil
-	}
-	if sess.isAllowed(tool) {
-		return nil
-	}
-	toolCall := acp1.ToolCallUpdate{ToolCallID: id, Status: new(acp1.ToolCallStatusPending), Content: content}
-	choice, allowed, err := stream.RequestPermission(ctx, toolCall,
-		acp1.NewPermissionOption(acp1.PermissionOptionKindAllowOnce, "Allow"),
-		acp1.NewPermissionOption(acp1.PermissionOptionKindAllowAlways, "Always allow "+tool),
-		acp1.NewPermissionOption(acp1.PermissionOptionKindRejectOnce, "Reject"))
-	if err != nil {
-		return err
-	}
-	// Anything but an allowing choice, including a cancelled request, rejects.
-	if !allowed {
-		return errRejected
-	}
-	if choice.Kind == acp1.PermissionOptionKindAllowAlways {
-		sess.allow(tool)
-	}
-	return nil
 }

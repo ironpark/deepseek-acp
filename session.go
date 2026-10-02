@@ -48,8 +48,10 @@ type session struct {
 	// a note is added only when it changes. The system prompt stays
 	// byte-stable, which keeps DeepSeek's prefix cache warm.
 	toldContext string
-	// allowed holds the tools the user chose to always allow.
+	// allowed and denied hold the rule keys the user chose to always allow
+	// or reject.
 	allowed map[string]bool
+	denied  map[string]bool
 	// todos is the plan the model keeps with todo_write.
 	todos []acp1.PlanEntry
 	title string
@@ -208,21 +210,6 @@ func (s *session) setPlanMode(on bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.planMode = on
-}
-
-func (s *session) isAllowed(tool string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.allowed[tool]
-}
-
-func (s *session) allow(tool string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.allowed == nil {
-		s.allowed = map[string]bool{}
-	}
-	s.allowed[tool] = true
 }
 
 func (s *session) setTodos(todos []acp1.PlanEntry) {
@@ -436,6 +423,7 @@ type savedSession struct {
 	Effort  string             `json:"effort"`
 	History []deepseek.Message `json:"history,omitzero"`
 	Allowed []string           `json:"allowed,omitzero"`
+	Denied  []string           `json:"denied,omitzero"`
 	Todos   []acp1.PlanEntry   `json:"todos,omitzero"`
 	Title   string             `json:"title,omitzero"`
 	Updated time.Time          `json:"updated,omitzero"`
@@ -452,7 +440,7 @@ func (s *session) MarshalJSON() ([]byte, error) {
 	s.mu.Lock()
 	saved := savedSession{
 		Cwd: s.cwd, Mode: s.mode, Model: s.model, Effort: s.effort, History: slices.Clone(s.history),
-		Allowed: slices.Sorted(maps.Keys(s.allowed)), Todos: s.todos, Title: s.title, Updated: s.updated,
+		Allowed: slices.Sorted(maps.Keys(s.allowed)), Denied: slices.Sorted(maps.Keys(s.denied)), Todos: s.todos, Title: s.title, Updated: s.updated,
 		Usage: s.usage, Context: s.contextUsed, Plan: s.planMode, Goal: s.goal.clone(),
 	}
 	s.mu.Unlock()
@@ -469,11 +457,11 @@ func (s *session) UnmarshalJSON(data []byte) error {
 	s.history, s.todos, s.title, s.updated = saved.History, saved.Todos, saved.Title, saved.Updated
 	s.usage, s.contextUsed = saved.Usage, saved.Context
 	s.planMode, s.goal = saved.Plan, saved.Goal
-	for _, tool := range saved.Allowed {
-		if s.allowed == nil {
-			s.allowed = map[string]bool{}
-		}
-		s.allowed[tool] = true
+	for _, key := range saved.Allowed {
+		s.remember(key, true)
+	}
+	for _, key := range saved.Denied {
+		s.remember(key, false)
 	}
 	return nil
 }
