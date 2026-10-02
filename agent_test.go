@@ -333,3 +333,49 @@ func TestGoGrepAndLocalCommand(t *testing.T) {
 		t.Errorf("runLocally long output: %d bytes, %v", len(result), err)
 	}
 }
+
+func TestLoadSessionReplaysToolContent(t *testing.T) {
+	dir := t.TempDir()
+	conn, client, store, newResp := startAgent(t, dir, &fakeDeepSeek{})
+	sess, _, _ := store.Get(t.Context(), newResp.SessionID)
+	sess.history = []deepseek.Message{
+		{Role: "user", Content: []deepseek.Block{deepseek.TextBlock("fix it")}},
+		{Role: "assistant", Content: []deepseek.Block{
+			{Type: "tool_use", ID: "t1", Name: "edit", Input: []byte(`{"file_path":"a.go","old_string":"x","new_string":"y"}`)},
+			{Type: "tool_use", ID: "t2", Name: "bash", Input: []byte(`{"command":"go test","description":"Run tests"}`)},
+		}},
+		{Role: "user", Content: []deepseek.Block{
+			deepseek.ToolResultBlock("t1", "Edited a.go", false),
+			deepseek.ToolResultBlock("t2", "FAIL\n[exit code: 1]", true),
+		}},
+	}
+	if err := store.Set(t.Context(), newResp.SessionID, sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.LoadSession(t.Context(), &acp1.LoadSessionRequest{SessionID: newResp.SessionID, Cwd: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	var diff *acp1.ToolCallContentDiff
+	var output string
+	for _, n := range client.Updates() {
+		update, ok := n.Update.As[acp1.SessionUpdateToolCallUpdate]()
+		if !ok {
+			continue
+		}
+		for _, c := range update.Content {
+			if d, ok := c.As[acp1.ToolCallContentDiff](); ok {
+				diff = &d
+			}
+			if text, ok := c.As[acp1.ToolCallContentContent](); ok {
+				output, _ = acp1.TextOf(text.Content)
+			}
+		}
+	}
+	if diff == nil || diff.Path != filepath.Join(dir, "a.go") || *diff.OldText != "x" || diff.NewText != "y" {
+		t.Errorf("replayed edit diff = %+v", diff)
+	}
+	if output != "```\nFAIL\n[exit code: 1]\n```" {
+		t.Errorf("replayed command output = %q", output)
+	}
+}

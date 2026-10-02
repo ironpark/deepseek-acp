@@ -145,20 +145,59 @@ func (a *deepseekAgent) replay(ctx context.Context, stream *acp1.SessionStream, 
 
 func (a *deepseekAgent) replayToolCall(ctx context.Context, stream *acp1.SessionStream, sess *session, call, result deepseek.Block) error {
 	title, kind := call.Name, acp1.ToolKindOther
+	var locations []acp1.ToolCallLocation
 	if act, err := a.parseTool(sess, call); err == nil {
 		if act.hidden {
 			return nil // the plan is sent once, at the end
 		}
-		title, kind = act.title, act.kind
+		title, kind, locations = act.title, act.kind, act.locations
 	}
 	id := acp1.GenerateToolCallID()
-	if err := stream.StartToolCall(ctx, id, title, kind); err != nil {
+	if err := stream.StartToolCall(ctx, id, title, kind,
+		acp1.WithLocations(locations...), acp1.WithRawInput(call.Input)); err != nil {
 		return err
 	}
+	content := acp1.WithToolContent(replayContent(sess, call, result)...)
 	if result.IsError {
-		return stream.FailToolCall(ctx, id)
+		return stream.FailToolCall(ctx, id, content)
 	}
-	return stream.CompleteToolCall(ctx, id)
+	return stream.CompleteToolCall(ctx, id, content)
+}
+
+// replayContent rebuilds what a tool call showed from its arguments and
+// result: an edit's change as a diff, a new file's content, a command's
+// output and a failure's error. The rest showed summaries the history does
+// not keep.
+func replayContent(sess *session, call, result deepseek.Block) []acp1.ToolCallContent {
+	switch call.Name {
+	case editTool.Name:
+		args, err := decodeArgs[struct {
+			FilePath  string `json:"file_path"`
+			OldString string `json:"old_string"`
+			NewString string `json:"new_string"`
+		}](call)
+		if err == nil && !result.IsError {
+			return []acp1.ToolCallContent{acp1.ToolDiff(sess.resolve(args.FilePath), &args.OldString, args.NewString)}
+		}
+	case writeTool.Name:
+		args, err := decodeArgs[struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+		}](call)
+		// An overwritten file's old content is gone, so only a new file
+		// shows as a diff.
+		if err == nil && strings.HasPrefix(result.Content, "Created ") {
+			return []acp1.ToolCallContent{acp1.ToolDiff(sess.resolve(args.FilePath), nil, args.Content)}
+		}
+	case bashTool.Name:
+		if result.Content != "" {
+			return []acp1.ToolCallContent{acp1.ToolText("```\n" + strings.TrimRight(result.Content, "\n") + "\n```")}
+		}
+	}
+	if result.IsError && result.Content != "" {
+		return []acp1.ToolCallContent{acp1.ToolText(result.Content)}
+	}
+	return nil
 }
 
 // Prompt runs the turn under the embedded manager, whose CancelSession
