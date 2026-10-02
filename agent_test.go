@@ -218,7 +218,7 @@ func TestPromptRunsToolLoop(t *testing.T) {
 	if got := client.Text(newResp.SessionID); got != "Wrote hello.txt." {
 		t.Errorf("streamed text = %q", got)
 	}
-	for _, want := range []string{"agent_thought_chunk", "tool_call", "tool_call_update", "agent_message_chunk", "usage_update"} {
+	for _, want := range []string{"agent_thought_chunk", "tool_call", "tool_call_update", "agent_message_chunk", "usage_update", "session_info_update"} {
 		if !client.seen(want) {
 			t.Errorf("updates %v: missing %s", client.tags(), want)
 		}

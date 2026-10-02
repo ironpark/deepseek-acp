@@ -13,6 +13,7 @@ import (
 
 	acp "github.com/ironpark/acp-go"
 	"github.com/ironpark/acp-go/acp1"
+	"github.com/ironpark/acp-go/schema/optional"
 
 	"github.com/ironpark/deepseek-acp/internal/deepseek"
 )
@@ -188,7 +189,15 @@ func (a *deepseekAgent) promptTurn(ctx context.Context, sessionID acp1.SessionID
 		return "", err
 	}
 	model, _ := sess.settings()
-	sess.setTitleFrom(acp1.JoinTexts(prompt))
+	if title, ok := sess.setTitleFrom(acp1.JoinTexts(prompt)); ok {
+		// The client shows the title now rather than on its next session/list.
+		update := acp1.SessionUpdateSessionInfoUpdate{
+			Title: optional.Of(title), UpdatedAt: optional.Of(time.Now().UTC().Format(time.RFC3339Nano)),
+		}
+		if err := acp1.NewSessionStream(a.client, sessionID).Send(ctx, update); err != nil {
+			return "", err
+		}
+	}
 	reason, err := a.runTurn(ctx, sessionID, sess, promptBlocks(prompt, lookupModel(model).images))
 	if err != nil {
 		return "", err

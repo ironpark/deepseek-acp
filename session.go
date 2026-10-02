@@ -492,15 +492,17 @@ func (s *session) SessionInfo() acp1.SessionInfo {
 	return info
 }
 
-// setTitleFrom names the session after its first prompt.
-func (s *session) setTitleFrom(prompt string) {
+// setTitleFrom names the session after its first prompt, and returns the
+// title if it named it.
+func (s *session) setTitleFrom(prompt string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.title != "" {
-		return
+		return "", false
 	}
 	title := []rune(strings.Join(strings.Fields(prompt), " "))
 	s.title = string(title[:min(len(title), titleLength)])
+	return s.title, s.title != ""
 }
 
 // ListSessions lists the saved sessions, newest first.
