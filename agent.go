@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,8 +22,12 @@ import (
 // newAgent returns the constructor of the agent for a connection.
 func newAgent(cfg *config, store acp1.SessionStore[*session], llm *deepseek.Client, logger *slog.Logger) func(*acp1.AgentSideConnection) acp1.Agent {
 	manager := acp1.NewSessionManager(store,
-		func(_ context.Context, params *acp1.NewSessionRequest) (acp1.SessionID, *session, error) {
-			return acp1.GenerateSessionID(), newSession(params.Cwd, cfg), nil
+		func(ctx context.Context, params *acp1.NewSessionRequest) (acp1.SessionID, *session, error) {
+			sess := newSession(params.Cwd, cfg)
+			if len(params.MCPServers) > 0 {
+				sess.mcp = connectMCP(ctx, params.MCPServers, params.Cwd, logger)
+			}
+			return acp1.GenerateSessionID(), sess, nil
 		},
 		// A turn always leaves the history whole, even when cancelled, so the
 		// session is saved whenever one ends.
@@ -47,6 +52,7 @@ type deepseekAgent struct {
 func (a *deepseekAgent) Initialize(context.Context, *acp1.InitializeRequest) (*acp1.InitializeResponse, error) {
 	agentCaps := acp1.CapabilitiesOf(a)
 	agentCaps.PromptCapabilities = &acp1.PromptCapabilities{Image: new(true), EmbeddedContext: new(true)}
+	agentCaps.MCPCapabilities = &acp1.MCPCapabilities{HTTP: new(true), SSE: new(true)}
 	return &acp1.InitializeResponse{
 		ProtocolVersion:   acp1.ProtocolVersion,
 		AgentCapabilities: agentCaps,
@@ -64,6 +70,7 @@ func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessio
 	if sess.setCwd(params.Cwd) {
 		a.save(ctx, params.SessionID, sess)
 	}
+	a.setMCP(ctx, sess, params.MCPServers)
 	stream := acp1.NewSessionStream(a.client, params.SessionID)
 	if err := a.replay(ctx, stream, sess); err != nil {
 		return nil, err
@@ -78,19 +85,42 @@ func (a *deepseekAgent) LoadSession(ctx context.Context, params *acp1.LoadSessio
 }
 
 // ResumeSession resumes the session through the manager, which also
-// advertises the slash commands, and restores the client's context usage
-// display.
+// advertises the slash commands, connects the client's MCP servers and
+// restores the client's context usage display.
 func (a *deepseekAgent) ResumeSession(ctx context.Context, params *acp1.ResumeSessionRequest) (*acp1.ResumeSessionResponse, error) {
+	sess, err := a.Lookup(ctx, params.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	a.setMCP(ctx, sess, params.MCPServers)
 	resp, err := a.SessionManager.ResumeSession(ctx, params)
 	if err != nil {
 		return nil, err
 	}
-	if sess, err := a.Lookup(ctx, params.SessionID); err == nil {
-		if err := a.sendContextUsage(ctx, acp1.NewSessionStream(a.client, params.SessionID), sess); err != nil {
-			return nil, err
-		}
+	if err := a.sendContextUsage(ctx, acp1.NewSessionStream(a.client, params.SessionID), sess); err != nil {
+		return nil, err
 	}
 	return resp, nil
+}
+
+// CloseSession ends the session's turn and its MCP connections.
+func (a *deepseekAgent) CloseSession(ctx context.Context, params *acp1.CloseSessionRequest) (*acp1.CloseSessionResponse, error) {
+	resp, err := a.SessionManager.CloseSession(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	if sess, err := a.Lookup(ctx, params.SessionID); err == nil {
+		sess.closeMCP()
+	}
+	return resp, nil
+}
+
+// DeleteSession ends the session's MCP connections and removes it.
+func (a *deepseekAgent) DeleteSession(ctx context.Context, params *acp1.DeleteSessionRequest) (*acp1.DeleteSessionResponse, error) {
+	if sess, err := a.Lookup(ctx, params.SessionID); err == nil {
+		defer sess.closeMCP()
+	}
+	return a.SessionManager.DeleteSession(ctx, params)
 }
 
 // sendContextUsage tells the client how full the context window is, as of
@@ -260,7 +290,7 @@ func (a *deepseekAgent) turnRequest(sess *session) (deepseek.Request, modelInfo)
 		Model:     model,
 		MaxTokens: a.cfg.maxTokens,
 		System:    a.systemPrompt(sess, model),
-		Tools:     tools,
+		Tools:     slices.Concat(tools, sess.mcpTools()),
 		Thinking:  &deepseek.Thinking{Type: "enabled"},
 	}
 	if effort == "off" {

@@ -405,6 +405,9 @@ func (a *deepseekAgent) parseTool(sess *session, call deepseek.Block) (*action, 
 			},
 		}, nil
 	}
+	if tool, ok := sess.lookupMCPTool(call.Name); ok {
+		return a.mcpAction(sess, call, tool)
+	}
 	return nil, fmt.Errorf("unknown tool %q", call.Name)
 }
 

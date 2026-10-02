@@ -17,6 +17,9 @@ A DeepSeek coding agent that speaks the [Agent Client Protocol](https://agentcli
   A permission request can allow or reject once or always, or switch the session to `full-access`. "Always" remembers a
   file tool, or a command by its program (`ls`) or subcommand (`go test`, which also covers `go test ./...`); a command
   with pipes, redirections, `$` expansions or several commands is remembered only as written.
+- MCP servers the client names in `session/new`, `load` and `resume` (stdio, HTTP and SSE) are connected, and their
+  tools are offered to the model as `mcp__<server>__<tool>`. A tool that does not declare itself read-only asks for
+  permission like a command.
 - Sessions are saved to disk and support `session/list`, `load`, `resume`, `close`, `delete`.
 - `AGENTS.md` (or `CLAUDE.md`) in the working directory is added to the system prompt.
 - Reports context window usage (`usage_update`, also restored on `session/load` and `resume`) and the session's token

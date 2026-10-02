@@ -73,8 +73,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger.Info("deepseek-acp ready", "version", version, "model", cfg.defaultModel, "sessions", cfg.sessionDir)
-	if err := conn.Start(ctx); err != nil && ctx.Err() == nil {
+	err = conn.Start(ctx)
+	closeAllMCP(store)
+	if err != nil && ctx.Err() == nil {
 		logger.Error("connection ended", "error", err)
 		os.Exit(1)
+	}
+}
+
+// closeAllMCP ends every session's MCP connections, which stops the servers
+// the agent started.
+func closeAllMCP(store acp1.SessionStore[*session]) {
+	ctx := context.Background()
+	ids, _ := store.List(ctx)
+	for _, id := range ids {
+		if sess, ok, _ := store.Get(ctx, id); ok {
+			sess.closeMCP()
+		}
 	}
 }

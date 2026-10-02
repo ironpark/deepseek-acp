@@ -60,6 +60,10 @@ type session struct {
 	// contextUsed is how much of the context window the last call filled.
 	usage       tokenUsage
 	contextUsed int
+
+	// mcp holds the connections to the client's MCP servers, which are not
+	// saved.
+	mcp *mcpServers
 }
 
 // tokenUsage counts tokens across a session's model calls.
